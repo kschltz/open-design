@@ -17,8 +17,13 @@
      emptied when no webfonts were harvested) so specimens render for real. -->
 <style data-brand-fonts>__OD_BRAND_FONTFACE__</style>
 <style>
+  /* Default chrome — overwritten by JS once the brand payload lands. The kit
+     still has to look coherent during the "extracting" skeleton phase, so the
+     neutral defaults are warm-paper, system-sans, hairline borders, and a
+     gentle accent. The accent variable is later set to the brand's primary
+     color so the page feels on-brand the moment brand.json arrives. */
   :root {
-    --paper: #faf9f5;
+    --paper: #fffefb;
     --surface: #ffffff;
     --ink: #1a1a18;
     --ink-mute: #57564f;
@@ -26,12 +31,13 @@
     --line: #e7e5dc;
     --line-soft: #efeee7;
     --accent: #c96442;
+    --accent-ink: #1a1a18;
     --ok: #3d7a4f;
     --err: #b4453a;
-    --radius: 14px;
-    --font-display: ui-serif, Georgia, 'Times New Roman', serif;
-    --font-body: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-    --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --radius: 12px;
+    --font-display: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica Neue, Arial, sans-serif;
+    --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica Neue, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
@@ -40,15 +46,19 @@
     color: var(--ink);
     font-family: var(--font-body);
     font-size: 15px;
-    line-height: 1.5;
+    line-height: 1.55;
     -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
   }
   .wrap { max-width: 1040px; margin: 0 auto; padding: 40px 28px 96px; }
   a { color: inherit; }
+  *:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .btn:focus-visible, .logo-thumb:focus-visible, .shot:focus-visible, .asset:focus-visible, .ds-tab:focus-visible { outline-offset: 3px; }
 
   header.kit-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 16px; }
-  .kit-title { font-family: var(--font-display); font-size: 40px; line-height: 1.05; font-weight: 600; letter-spacing: -0.02em; margin: 0; }
-  .kit-tagline { margin: 6px 0 0; font-size: 18px; color: var(--ink-mute); }
+  .kit-title { font-family: var(--font-display); font-size: 40px; line-height: 1.05; font-weight: 700; letter-spacing: -0.02em; margin: 0; word-break: break-word; }
+  @media (max-width: 720px) { .kit-title { font-size: 30px; } }
+  .kit-tagline { margin: 6px 0 0; font-size: 18px; color: var(--ink-mute); font-weight: 600; letter-spacing: -0.005em; }
   .kit-source { margin-top: 6px; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-faint); text-decoration: none; }
   .kit-source:hover { color: var(--accent); }
   .head-actions { display: flex; align-items: center; gap: 8px; }
@@ -71,9 +81,12 @@
   }
   .card { border: 1px solid var(--line-soft); background: var(--surface); border-radius: var(--radius); padding: 18px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
 
-  /* Logo */
-  .logo-stage { display: flex; min-height: 158px; align-items: center; justify-content: center; border: 1px solid var(--line-soft); border-radius: var(--radius); padding: 28px; }
-  .logo-stage img { max-height: 92px; max-width: 100%; object-fit: contain; }
+  /* Logo — wordmark SVGs need horizontal room; square marks need square rooms.
+     The square thumbnails (.logo-thumb .sq) constrain aspect-ratio at 1:1 so
+     a 1200x630 social card doesn't blow out the row. */
+  .logo-stage { display: flex; min-height: 168px; align-items: center; justify-content: center; border: 1px solid var(--line-soft); border-radius: var(--radius); padding: 28px; background: var(--surface); }
+  .logo-stage img { max-height: 96px; max-width: 78%; width: auto; object-fit: contain; }
+  .logo-stage img.mark-square { max-height: 72px; max-width: 72px; }
   .logo-empty { display: flex; min-height: 158px; flex-direction: column; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--ink-faint); font-size: 14px; }
   .logo-thumbs { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
   .logo-thumb { width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line-soft); border-radius: 9px; padding: 6px; cursor: pointer; }
@@ -106,18 +119,26 @@
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 500; }
   .voice-tone { margin: 12px 0 0; font-size: 14px; color: var(--ink-mute); line-height: 1.55; }
-  .pillars { margin: 12px 0 0; padding: 0; list-style: none; font-size: 14px; }
-  .pillars li { display: flex; gap: 8px; margin-top: 4px; }
+  /* Pillars — dividers so each one claims its line instead of crowding the
+     tone paragraph above. */
+  .pillars { margin: 14px 0 0; padding: 0; list-style: none; font-size: 14px; }
+  .pillars li { display: flex; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line-soft); }
+  .pillars li:last-child { border-bottom: 1px solid var(--line-soft); }
+  .voice-card { padding: 22px 22px 22px; }
   .vocab { margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; border-top: 1px solid var(--line-soft); padding-top: 12px; font-size: 12px; }
   .vocab .k { font-weight: 600; }
   .vocab .use .k { color: var(--ok); }
   .vocab .avoid .k { color: var(--err); }
   .vocab .v { margin-top: 4px; color: var(--ink-mute); }
 
-  /* Imagery */
-  .imagery p { margin: 0; font-size: 14px; }
-  .imagery p + p { margin-top: 6px; color: var(--ink-mute); }
-  .imagery .k { font-weight: 600; color: var(--ink); }
+  /* Imagery card — block-row layout puts each field on a labelled divider so
+     a long style/treatment string doesn't crowd the labels. */
+  .imagery p { margin: 0; font-size: 14px; line-height: 1.55; }
+  .imagery p + p { margin-top: 10px; color: var(--ink-mute); }
+  .imagery .k { display: block; font-weight: 600; color: var(--ink); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
+  .imagery .block-row { display: block; padding: 10px 0; border-top: 1px solid var(--line-soft); }
+  .imagery .block-row.avoid .k, .imagery .block-row.avoid .v { color: var(--err); }
+  .imagery .block-row:first-of-type { border-top: 0; padding-top: 4px; }
   .posture { margin-top: 12px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
   .posture ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--ink-mute); }
   .posture ul li { margin-top: 2px; }
@@ -153,9 +174,12 @@
   .asset-name .open { font-size: 11px; color: var(--accent); }
   .asset-desc { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
 
-  /* Hero banner — surfaces the first harvested brand image for visual richness */
-  .kit-hero { margin-top: 22px; border: 1px solid var(--line-soft); border-radius: var(--radius); overflow: hidden; background: var(--line-soft); aspect-ratio: 16 / 5; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+  /* Hero band — uses brand accent when imagery is missing so the page always
+     has a warm anchor, never an empty gray box. Color overwrites happen in JS
+     once the payload lands. */
+  .kit-hero { margin-top: 22px; border: 1px solid var(--line-soft); border-radius: var(--radius); overflow: hidden; background: var(--line-soft); aspect-ratio: 16 / 5; box-shadow: 0 1px 2px rgba(0,0,0,.03); position: relative; }
   .kit-hero img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .kit-hero-fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--accent-ink); font-family: var(--font-display); font-weight: 700; font-size: clamp(28px, 4vw, 48px); letter-spacing: -0.02em; text-align: center; padding: 24px; }
 
   /* Font specimen tiles — a big "Ag" glyph per real family, in its own face */
   .fonts { display: grid; gap: 12px; grid-template-columns: repeat(2, 1fr); margin-bottom: 14px; }
@@ -282,8 +306,12 @@
   var muted = role(brand, 'muted', '#57564f');
   var accent = role(brand, 'accent', '#c96442');
 
-  // Apply brand accent/ink to the page chrome so the kit feels on-brand.
   document.documentElement.style.setProperty('--accent', accent);
+  // Pick a legible ink-on-accent fallback for the hero band so the brand name
+  // is readable regardless of which accent the brand ships.
+  var accentInk = role(brand, 'foreground', '#1a1a18');
+  if (isLight(accent)) accentInk = '#191200';
+  document.documentElement.style.setProperty('--accent-ink', accentInk);
 
   var typo = brand.typography || {};
   var googleLinks = [typo.display, typo.body, typo.mono]
@@ -308,12 +336,18 @@
         ? '<div class="skel" style="width:60%;height:48px"></div><span class="muted">Looking for a logo…</span>'
         : 'No logo found') + '</div>';
     }
+    function isSquareMark(c) {
+      // Square marks (apple-touch, favicon, og-card) need a square slot so the
+      // 1200x630 social card doesn't blow out the wordmark visually.
+      return /favicon|apple-touch|og-image|\/icon\.|mark\.(png|jpg)$/i.test(c);
+    }
+    var primarySquare = isSquareMark(cands[0]);
     var thumbs = cands.length > 1 ? '<div class="logo-thumbs">' + cands.map(function (c, i) {
-      return '<button class="logo-thumb' + (i===0?' active':'') + '" data-src="' + esc(c) + '" style="background:' + esc(bg) + '"><img src="' + esc(c) + '" alt=""></button>';
+      return '<button class="logo-thumb' + (i===0?' active':'') + '" data-src="' + esc(c) + '" data-square="' + (isSquareMark(c) ? '1' : '0') + '" style="background:' + esc(bg) + '"><img src="' + esc(c) + '" alt=""></button>';
     }).join('') + '</div>' : '';
     var notes = brand.logo && brand.logo.notes ? '<p class="logo-notes">' + esc(brand.logo.notes) + '</p>' : '';
     return '<div class="logo-stage" id="logo-stage" style="background:' + esc(bg) + '">' +
-      '<img id="logo-img" src="' + esc(cands[0]) + '" alt="' + esc(brand.name || 'logo') + '"></div>' + thumbs + notes;
+      '<img id="logo-img" src="' + esc(cands[0]) + '" class="' + (primarySquare ? 'mark-square' : '') + '" style="' + (primarySquare ? 'max-width:72px' : '') + '" alt="' + esc(brand.name || 'logo') + '"></div>' + thumbs + notes;
   }
 
   // Big "Ag" specimen tile per real family (display / body / mono), each set in
@@ -362,10 +396,14 @@
       }).join('') + '</div></section>';
   }
 
-  // Optional hero band: surfaces the first harvested image for visual richness.
+  // Optional hero band: surfaces the first harvested image, with a brand-typed
+  // colored-card fallback when imagery is missing so the page still anchors.
   function heroHtml() {
     var samples = imagerySamples();
-    if (!samples.length) return '';
+    if (!samples.length) {
+      var title = brand.name || (data.host || 'Brand');
+      return '<div class="kit-hero"><div class="kit-hero-fallback">' + esc(title) + '</div></div>';
+    }
     return '<div class="kit-hero"><img src="' + esc(samples[0].file) + '" alt="' + esc(brand.name || '') + '" loading="lazy"></div>';
   }
 
@@ -407,7 +445,7 @@
 
   function voiceHtml() {
     var v = brand.voice || {};
-    if (!arr(v.adjectives).length && !v.tone) {
+    if (!arr(v.adjectives).length && !v.tone && !arr(v.vocabulary && v.vocabulary.use).length && !arr(v.vocabulary && v.vocabulary.avoid).length) {
       return '<div class="card"><div class="skel skel-line" style="width:40%"></div><div class="skel skel-line" style="width:85%"></div><div class="skel skel-line" style="width:75%"></div></div>';
     }
     var chips = arr(v.adjectives).map(function (a) {
@@ -416,27 +454,35 @@
     var pillars = arr(v.messagingPillars).length ? '<ul class="pillars">' + arr(v.messagingPillars).map(function (p) {
       return '<li><span style="color:' + esc(accent) + '">—</span><span>' + esc(p) + '</span></li>';
     }).join('') + '</ul>' : '';
-    var vocab = (v.vocabulary && (arr(v.vocabulary.use).length || arr(v.vocabulary.avoid).length))
-      ? '<div class="vocab"><div class="use"><div class="k">Use</div><div class="v">' + esc(arr(v.vocabulary.use).join(' · ')) + '</div></div>' +
-        '<div class="avoid"><div class="k">Avoid</div><div class="v">' + esc(arr(v.vocabulary.avoid).join(' · ')) + '</div></div></div>' : '';
-    return '<div class="card"><div class="chips">' + chips + '</div>' +
+    var use = arr(v.vocabulary && v.vocabulary.use);
+    var avoid = arr(v.vocabulary && v.vocabulary.avoid);
+    var vocab = (use.length || avoid.length)
+      ? '<div class="vocab">' +
+        (use.length ? '<div class="use"><div class="k">Use</div><div class="v">' + esc(use.join(' · ')) + '</div></div>' : '<div></div>') +
+        (avoid.length ? '<div class="avoid"><div class="k">Avoid</div><div class="v">' + esc(avoid.join(' · ')) + '</div></div>' : '<div></div>') +
+        '</div>' : '';
+    return '<div class="card voice-card"><div class="chips">' + chips + '</div>' +
       (v.tone ? '<p class="voice-tone">' + esc(v.tone) + '</p>' : '') + pillars + vocab + '</div>';
   }
 
   function imageryHtml() {
     var im = brand.imagery || {};
     var lay = brand.layout || {};
-    if (!im.style && !arr(lay.postureRules).length) {
+    var hasIm = !!(im.style || im.treatment || arr(im.subjects).length || arr(im.avoid).length);
+    var hasPosture = arr(lay.postureRules).length;
+    if (!hasIm && !hasPosture) {
       return '<div class="card"><div class="skel skel-line" style="width:90%"></div><div class="skel skel-line" style="width:70%"></div></div>';
     }
-    var posture = arr(lay.postureRules).length ? '<div class="posture"><div class="type-label">Layout posture</div><ul>' +
+    var imBlocks = '';
+    if (hasIm) {
+      if (im.style) imBlocks += '<p>' + esc(im.style) + '</p>';
+      if (arr(im.subjects).length) imBlocks += '<p class="block-row"><span class="k">Subjects</span><span class="v">' + esc(arr(im.subjects).join(' · ')) + '</span></p>';
+      if (im.treatment) imBlocks += '<p class="block-row"><span class="k">Treatment</span><span class="v">' + esc(im.treatment) + '</span></p>';
+      if (arr(im.avoid).length) imBlocks += '<p class="block-row avoid"><span class="k">Avoid</span><span class="v">' + esc(arr(im.avoid).join(' · ')) + '</span></p>';
+    }
+    var posture = hasPosture ? '<div class="posture"><div class="type-label">Layout posture</div><ul>' +
       arr(lay.postureRules).map(function (r) { return '<li>' + esc(r) + '</li>'; }).join('') + '</ul></div>' : '';
-    return '<div class="card imagery">' +
-      (im.style ? '<p>' + esc(im.style) + '</p>' : '') +
-      (arr(im.subjects).length ? '<p><span class="k">Subjects:</span> ' + esc(arr(im.subjects).join(', ')) + '</p>' : '') +
-      (im.treatment ? '<p><span class="k">Treatment:</span> ' + esc(im.treatment) + '</p>' : '') +
-      (arr(im.avoid).length ? '<p><span class="k" style="color:var(--err)">Avoid:</span> ' + esc(arr(im.avoid).join(', ')) + '</p>' : '') +
-      posture + '</div>';
+    return '<div class="card imagery">' + imBlocks + posture + '</div>';
   }
 
   function tokenChip(label, hex) {
@@ -528,11 +574,17 @@
 
   document.getElementById('root').innerHTML = html;
 
-  // Logo thumbnail switcher.
+  // Logo thumbnail switcher. When the picked candidate is a square mark, the
+  // <img> gets the mark-square class so the layout treats it as a badge.
   var img = document.getElementById('logo-img');
   Array.prototype.forEach.call(document.querySelectorAll('.logo-thumb'), function (b) {
     b.addEventListener('click', function () {
-      if (img) img.src = b.getAttribute('data-src');
+      if (img) {
+        img.src = b.getAttribute('data-src');
+        var sq = b.getAttribute('data-square') === '1';
+        img.classList.toggle('mark-square', sq);
+        img.style.maxWidth = sq ? '72px' : '';
+      }
       Array.prototype.forEach.call(document.querySelectorAll('.logo-thumb'), function (x) { x.classList.remove('active'); });
       b.classList.add('active');
     });
