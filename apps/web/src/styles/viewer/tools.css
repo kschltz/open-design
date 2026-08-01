@@ -29,6 +29,10 @@
 .op-status-running { color: var(--purple); }
 .op-status-ok { color: var(--green); }
 .op-status-error { color: var(--red); }
+.op-status-category {
+  border-color: transparent;
+  background: var(--bg-panel);
+}
 .op-toggle {
   font-size: 10.5px;
   padding: 2px 8px;
@@ -66,7 +70,13 @@
   margin-bottom: 6px;
   font-weight: 500;
 }
-.produced-files-list { display: flex; flex-direction: column; gap: 2px; }
+.produced-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: min(34vh, 260px);
+  overflow-y: auto;
+}
 .produced-file {
   display: flex;
   align-items: center;
@@ -165,6 +175,10 @@
   padding-top: 0;
   border-top: none;
 }
+.plugin-action-panel > .plugin-action-card:only-child {
+  padding-top: 0;
+  border-top: none;
+}
 .plugin-action-card__main {
   display: flex;
   align-items: center;
@@ -243,6 +257,7 @@
   filter: brightness(0.85);
 }
 .plugin-action-card__notice {
+  margin-top: 8px;
   padding: 6px 8px;
   border-radius: var(--radius-sm);
   background: var(--bg-panel);
@@ -258,9 +273,21 @@
   word-break: break-all;
 }
 
-/* "Files this turn" summary — derived from Read/Write/Edit tool_use events
-   so users can scan every file the agent touched without expanding tool-
-   group disclosures. Compact pill while streaming, full list once done. */
+.plugin-action-candidate__details {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+
+.plugin-action-candidate__details p {
+  flex: 1 1 240px;
+  margin: 0;
+}
+
+/* "Files this turn" summary — derived from file operation tool_use events.
+   Show up to four files as part of the answer; larger batches stay compact
+   until the user opens the disclosure. */
 .file-ops {
   display: flex;
   flex-direction: column;
@@ -269,15 +296,18 @@
   background: var(--bg-panel);
   overflow: hidden;
 }
-.file-ops.is-streaming {
-  border-style: dashed;
-  background: var(--bg-subtle);
+.file-ops-head {
+  display: flex;
+  align-items: center;
+  min-width: 0;
 }
 .file-ops-toggle {
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
   padding: 7px 10px;
   background: transparent;
   border: 0;
@@ -288,6 +318,8 @@
   min-width: 0;
 }
 .file-ops-toggle:hover { background: var(--bg-subtle); }
+.file-ops-toggle--static { cursor: default; }
+.file-ops-toggle--static:hover { background: transparent; }
 .file-ops-icon { display: inline-flex; color: var(--text-muted); }
 .file-ops-label {
   font-size: 10.5px;
@@ -305,21 +337,19 @@
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
-.file-ops-count {
+.file-ops-more {
   font-size: 10.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
-  padding: 1px 6px;
-  border-radius: var(--radius);
-  background: var(--bg-subtle);
-  border: 1px solid var(--border);
+  white-space: nowrap;
 }
-.file-ops.is-streaming .file-ops-count {
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 30%, var(--border));
+.file-ops-chev {
+  display: inline-flex;
+  color: var(--text-muted);
+  transition: transform 120ms var(--ease-out);
 }
-.file-ops-chev { display: inline-flex; color: var(--text-muted); }
+.file-ops-chev.is-expanded { transform: rotate(180deg); }
 .file-ops-list {
   list-style: none;
   margin: 0;
@@ -327,18 +357,44 @@
   display: flex;
   flex-direction: column;
   gap: 3px;
+  max-height: min(34vh, 260px);
+  overflow-y: auto;
   border-top: 1px solid var(--border-soft, var(--border));
 }
+.file-ops-list--single {
+  padding: 0;
+  border-top: 0;
+  overflow: visible;
+}
 .file-ops-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  display: block;
+  padding: 0;
   border-radius: var(--radius-sm);
   font-size: 12px;
   min-width: 0;
 }
 .file-ops-row:hover { background: var(--bg-subtle); }
+.file-ops-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.file-ops-row-main--action {
+  cursor: pointer;
+}
+.file-ops-row-main--action:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  outline-offset: 1px;
+}
 .file-ops-row--running { color: var(--text); }
 .file-ops-row--error { color: var(--text); }
 .file-ops-row-badges { display: inline-flex; gap: 3px; flex-shrink: 0; }
@@ -379,6 +435,11 @@
   border-color: color-mix(in oklab, #b26500 35%, var(--border));
   background: color-mix(in oklab, #b26500 8%, var(--bg-subtle));
 }
+.file-ops-badge--delete {
+  color: #b42318;
+  border-color: color-mix(in oklab, #b42318 35%, var(--border));
+  background: color-mix(in oklab, #b42318 8%, var(--bg-subtle));
+}
 .file-ops-row-path {
   flex: 1;
   min-width: 0;
@@ -413,19 +474,22 @@
   color: #c0392b;
   background: color-mix(in oklab, #c0392b 12%, transparent);
 }
-.file-ops-row-open {
-  font-size: 11px;
-  padding: 3px 9px;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  cursor: pointer;
+.file-ops-row-open-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  color: var(--text-faint);
+  opacity: 0;
+  transform: translateX(-2px);
+  transition:
+    opacity 140ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 140ms cubic-bezier(0.23, 1, 0.32, 1);
 }
-.file-ops-row-open:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+.file-ops-row-main--action:hover .file-ops-row-open-icon,
+.file-ops-row-main--action:focus-visible .file-ops-row-open-icon {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 .op-bash .op-command,
@@ -434,13 +498,15 @@
   padding: 8px 12px;
   background: #1c1b1a;
   color: #f0eee9;
+  border-radius: var(--radius-md);
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 220px;
-  overflow-y: auto;
+  overflow: auto;
+  scrollbar-width: thin;
 }
 .op-bash .op-output { background: #2a2926; }
 
@@ -523,7 +589,7 @@
   top: calc(100% + 6px);
   right: 0;
   z-index: var(--viewer-action-menu-z);
-  min-width: 168px;
+  min-width: 204px;
   padding: 4px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
@@ -552,6 +618,18 @@
   justify-content: center;
   color: var(--text-muted);
   font-size: 12px;
+}
+.present-menu-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.present-menu-copy small {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
 }
 
 .share-menu { position: relative; display: inline-block; }
@@ -952,6 +1030,72 @@
 }
 .image-export-format-text span {
   display: none;
+}
+.pptx-export-mode-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.pptx-export-mode-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  cursor: pointer;
+  transition:
+    border-color 140ms cubic-bezier(0.23, 1, 0.32, 1),
+    background 140ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 140ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.pptx-export-mode-option:hover {
+  background: color-mix(in srgb, var(--bg-panel) 70%, transparent);
+}
+.pptx-export-mode-option.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--bg-panel);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 8%, transparent);
+}
+.pptx-export-mode-option input[type="radio"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.pptx-export-mode-option:has(input[type="radio"]:focus-visible) {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 2px;
+}
+.pptx-export-mode-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pptx-export-mode-title {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.pptx-export-mode-badge {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.pptx-export-mode-desc {
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
 }
 .image-export-modal .modal-foot {
   padding: 14px 24px 20px;

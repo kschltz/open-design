@@ -12,19 +12,24 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
   type CSSProperties,
   type Dispatch,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   type SetStateAction,
 } from 'react';
 import {
   defaultScenarioPluginIdForProjectMetadata,
   PROFILE_MEMORY_ID,
+  type AmrWalletSnapshot,
+  type ByokCredentialProfile,
   type ChatSessionMode,
   type ConnectorDetail,
   type InstalledPluginRecord,
+  type RunContextSelection,
+  type UpsertByokCredentialProfileRequest,
   type UpsertMemoryRequest,
 } from '@open-design/contracts';
 import type { OpenDesignHostProjectImportSuccess } from '@open-design/host';
@@ -47,8 +52,12 @@ import {
 import { getResolvedDeviceId } from '../analytics/client';
 import {
   beginAmrAuthTracking,
+  confirmAmrAuthTracking,
+  observeAmrAuthTracking,
+  reconcileAmrAuthAttemptId,
   resolveAmrAuthTracking,
 } from '../analytics/amr-auth';
+import { setOnboardingAttributionPersonProperties } from '../analytics/source-attribution';
 import {
   clearOnboardingSessionId,
   getOrCreateOnboardingSessionId,
@@ -65,8 +74,9 @@ import type {
   TrackingCliProviderId,
 } from '@open-design/contracts/analytics';
 import { agentIdToTracking } from '@open-design/contracts/analytics';
-import { useT } from '../i18n';
+import { useT, useI18n } from '../i18n';
 import { navigate, useRoute } from '../router';
+import { setPendingDesignSystemCreateEntry } from '../analytics/ds-create-entry';
 import type {
   AgentInfo,
   ApiProtocol,
@@ -86,11 +96,16 @@ import type {
 } from '../types';
 import { CenteredLoader } from './Loading';
 import { DesignsTab } from './DesignsTab';
-import { DesignSystemPreviewModal } from './DesignSystemPreviewModal';
 import { DesignSystemsTab } from './DesignSystemsTab';
 import { BrandsTab } from './BrandsTab';
 import { EntryNavRail, type EntryView as EntryViewKind } from './EntryNavRail';
+import { LibrarySection } from './LibrarySection';
 import { UpdaterPopup } from './UpdaterPopup';
+import { WhatsNewPopup } from './WhatsNewPopup';
+import { AmrBalanceDialog } from './AmrBalanceDialog';
+import { AmrLowBalanceDialog, type AmrLowBalanceDecision } from './AmrLowBalanceDialog';
+import { checkAmrBalanceGate } from '../runtime/amr-balance-gate';
+import { isPaidAmrPlan, resolveAmrPlan } from '../runtime/amr-low-balance-plan';
 import { GithubStarBadge } from './GithubStarBadge';
 import {
   formatDiscordPresenceCount,
@@ -102,23 +117,41 @@ import {
   createPluginUseHandoff,
   type HomePromptHandoff,
 } from './home-hero/plugin-authoring';
+import {
+  buildRecommendation,
+  type Recommendation,
+} from '../onboarding/recommendation';
+import type { OnboardingEntry } from '../onboarding/onboarding-entry';
+import { ONBOARDING_ARTIFACT_CHIP_IDS } from './home-hero/chips';
+import { homeHeroChipLabel } from './home-hero/chip-labels';
 import type { PluginUseAction } from './plugins-home/useActions';
 import { Icon } from './Icon';
+import { defaultAgentModelId, effectiveAgentModelChoice } from './agentModelSelection';
 import { AgentIcon } from './AgentIcon';
+import {
+  getModelCapabilityTag,
+  getModelCostTier,
+  MODEL_CAPABILITY_TAG_LABEL_KEYS,
+  MODEL_COST_TIER_LABEL_KEYS,
+  type ModelCapabilityTag,
+} from './modelCapabilityTags';
 import { LanguageMenu } from './LanguageMenu';
 import { IntegrationsView, type IntegrationTab } from './IntegrationsView';
 import { InlineModelSwitcher } from './InlineModelSwitcher';
+import { enterpriseUrl } from './enterpriseUrl';
 import {
   EntrySettingsMenu,
   type EntrySettingsSection,
 } from './EntrySettingsMenu';
+import { MessageCenter } from './MessageCenter';
 import { NewProjectModal } from './NewProjectModal';
 import { PluginsView } from './PluginsView';
 import type { CreateInput, CreateTab, ImportClaudeDesignOutcome } from './NewProjectPanel';
 import type { PluginLoopSubmit } from './PluginLoopHome';
-import type {
-  PluginShareAction,
-  PluginShareProjectOutcome,
+import {
+  createProject,
+  type PluginShareAction,
+  type PluginShareProjectOutcome,
 } from '../state/projects';
 import { TasksView } from './TasksView';
 import {
@@ -126,10 +159,14 @@ import {
   API_PROTOCOL_TABS,
   SUGGESTED_MODELS_BY_PROTOCOL,
 } from '../state/apiProtocols';
-import { KNOWN_PROVIDERS } from '../state/config';
+import {
+  applySavedByokCredentialProfile,
+  defaultKnownProviderModel,
+  KNOWN_PROVIDERS,
+} from '../state/config';
 import type { KnownProvider } from '../state/config';
 import { saveOnboardingProfile } from '../state/onboarding-profile';
-import { testApiProvider } from '../providers/connection-test';
+import { testAgent, testApiProvider } from '../providers/connection-test';
 import { fetchProviderModels } from '../providers/provider-models';
 import {
   cancelVelaLogin,
@@ -142,17 +179,15 @@ import {
   amrLoginPollOutcome,
   notifyAmrLoginStatusChanged,
 } from './amrLoginPolling';
-import { useBrandExtract } from '../runtime/useBrandExtract';
-import type { BrandReference } from '../runtime/brand-references';
-import { BrandReferencePicker } from './BrandReferencePicker';
 import { closeAmrActivationWindowBestEffort } from './AmrLoginPill';
-import { AnimatePresence } from 'motion/react';
 import { smoothScrollToTop } from '../utils/smoothScrollToTop';
 import { summarizeProjectNameFromPrompt } from '../utils/projectName';
+import { LIBRARY_UI_VISIBLE } from '../features/libraryUi';
 import {
   providerModelsCacheKey,
   type ProviderModelsCache,
 } from './providerModelsCache';
+import { resolveByokModelPreference } from './byok/validation';
 
 // Persist the entry nav-rail open/collapsed state so it survives both a
 // home -> project -> home navigation (EntryShell unmounts on the project
@@ -178,9 +213,14 @@ function writeStoredRailOpen(open: boolean): void {
   }
 }
 
-const DISCORD_URL = 'https://discord.gg/9ptkbbqRu';
+const DISCORD_URL = 'https://discord.gg/mHAjSMV6gz';
 const X_URL = 'https://x.com/OpenDesignHQ';
 const ONBOARDING_DROPDOWN_OPEN_EVENT = 'open-design:onboarding-dropdown-open';
+
+type OnboardingAgentTestState =
+  | { status: 'idle' }
+  | { status: 'running'; inputKey: string }
+  | { status: 'done'; inputKey: string; result: ConnectionTestResponse };
 
 // The topbar chips (GitHub star, model switcher, Use everywhere)
 // collapse into the settings dropdown when the viewport gets
@@ -204,12 +244,43 @@ const NEWSLETTER_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ONBOARDING_BYOK_AUTO_FETCH_DELAY_MS = 300;
 const ONBOARDING_BYOK_AUTO_TEST_DELAY_MS = 500;
 
+const ONBOARDING_AMR_MODEL_OPTIONS: NonNullable<AgentInfo['models']> = [
+  { id: 'claude-opus-4.8', label: 'Claude Opus 4.8' },
+  { id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+  { id: 'glm-5.1', label: 'GLM 5.1' },
+];
+
 type OnboardingProfileState = {
   role: string;
   orgSize: string;
   useCase: string[];
   source: string;
+  // Free-text detail when `source === 'other'`. Kept separate from `source`
+  // so attribution can still aggregate on the 'other' bucket while capturing
+  // the raw self-reported channel.
+  sourceOther: string;
   email: string;
+};
+
+type EntryCreateProjectInput = Omit<CreateInput, 'metadata'> & {
+  metadata?: CreateInput['metadata'];
+  pendingPrompt?: string;
+  pluginId?: string;
+  pluginType?: string;
+  appliedPluginSnapshotId?: string;
+  pluginInputs?: Record<string, unknown>;
+  initialRunContext?: RunContextSelection | null;
+  conversationMode?: ChatSessionMode;
+  autoSendFirstMessage?: boolean;
+  /** The home submit already ran the Open Design Cloud balance gate; the
+   *  project's first auto-send must not re-gate. */
+  amrGatePrechecked?: boolean;
+  requestId?: string;
+  pendingFiles?: File[];
+  userWorkingDirToken?: string;
+  linkedDirs?: string[] | null;
+  onboardingEntry?: OnboardingEntry;
 };
 
 function defaultPluginIdForMetadata(metadata: ProjectMetadata): string | null {
@@ -323,27 +394,23 @@ interface Props {
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
     id: string,
-    choice: { model?: string; reasoning?: string },
+    choice: { model?: string; reasoning?: string; serviceTier?: string },
   ) => void;
   onApiProtocolChange: (protocol: ApiProtocol) => void;
   onApiModelChange: (model: string) => void;
   onConfigPersist: (cfg: AppConfig) => Promise<void> | void;
+  /** True only when GET /api/app-config returned a real config object. */
+  daemonAppConfigReady?: boolean;
+  /** Non-optimistic daemon write for the silent-update preference. */
+  onSilentUpdatePreferenceChange?: (allowSilentUpdates: boolean) => Promise<void>;
+  onSkillsRefresh?: () => Promise<void> | void;
+  onSkillsChanged?: (affectedSkillId?: string) => void;
   onRefreshAgents: () => Promise<AgentInfo[]> | AgentInfo[];
   // Quick theme switch from the avatar-popover dropdown. Lets the user
   // flip between system / light / dark without opening the full Settings
   // dialog. App owns persistence; this component just calls the callback.
   onThemeChange: (theme: AppTheme) => void;
-  onCreateProject: (
-    input: CreateInput & {
-      pendingPrompt?: string;
-      pluginId?: string;
-      appliedPluginSnapshotId?: string;
-      pluginInputs?: Record<string, unknown>;
-      conversationMode?: ChatSessionMode;
-      autoSendFirstMessage?: boolean;
-      pendingFiles?: File[];
-    },
-  ) => Promise<boolean> | boolean | void;
+  onCreateProject: (input: EntryCreateProjectInput) => Promise<boolean> | boolean | void;
   onCreatePluginShareProject: (
     pluginId: string,
     action: PluginShareAction,
@@ -354,9 +421,10 @@ interface Props {
   ) => Promise<ImportClaudeDesignOutcome | void> | ImportClaudeDesignOutcome | void;
   onImportFolder?: (baseDir: string) => Promise<void> | void;
   onImportFolderResponse?: (response: OpenDesignHostProjectImportSuccess) => Promise<void> | void;
-  onOpenProject: (id: string) => Promise<boolean> | boolean | void;
+  onOpenProject: (id: string, fileName?: string) => Promise<boolean> | boolean | void;
   onOpenLiveArtifact: (projectId: string, artifactId: string) => void;
   onDeleteProject: (id: string) => Promise<boolean | void> | boolean | void;
+  onDuplicateProject?: (id: string) => Promise<void> | void;
   onRenameProject: (id: string, name: string) => void;
   onProjectsRefresh?: () => Promise<void> | void;
   onChangeDefaultDesignSystem: (id: string) => void;
@@ -370,8 +438,12 @@ interface Props {
   onOpenDesignSystem?: (id: string) => void;
   onDesignSystemsRefresh?: () => Promise<void> | void;
   onPersistComposioKey: (composio: AppConfig['composio']) => Promise<void> | void;
+  onPersistByokCredential?: (
+    input: UpsertByokCredentialProfileRequest,
+  ) => Promise<ByokCredentialProfile>;
   onOpenSettings: (section?: EntrySettingsSection) => void;
   onCompleteOnboarding: () => void;
+  artifactUpgradeSlot?: ReactNode;
 }
 
 // Map an EntryNavRail view id to the analytics `element` enum on
@@ -450,6 +522,10 @@ export function EntryShell({
   onApiProtocolChange,
   onApiModelChange,
   onConfigPersist,
+  daemonAppConfigReady = false,
+  onSilentUpdatePreferenceChange,
+  onSkillsRefresh,
+  onSkillsChanged,
   onRefreshAgents,
   onThemeChange,
   onCreateProject,
@@ -460,6 +536,7 @@ export function EntryShell({
   onOpenProject,
   onOpenLiveArtifact,
   onDeleteProject,
+  onDuplicateProject,
   onRenameProject,
   onProjectsRefresh,
   onChangeDefaultDesignSystem,
@@ -467,10 +544,13 @@ export function EntryShell({
   onOpenDesignSystem,
   onDesignSystemsRefresh,
   onPersistComposioKey,
+  onPersistByokCredential,
   onOpenSettings,
   onCompleteOnboarding,
+  artifactUpgradeSlot,
 }: Props) {
   const t = useT();
+  const { locale: uiLocale } = useI18n();
   const discordPresence = useDiscordPresence();
   // Each entry sub-view (home / projects / design-systems) is its own
   // URL now, so the browser back/forward buttons work and a deep link
@@ -478,8 +558,33 @@ export function EntryShell({
   // view from the route rather than keeping it in component state.
   const route = useRoute();
   const view: EntryViewKind = route.kind === 'home' ? route.view : 'home';
-  const [previewSystemId, setPreviewSystemId] = useState<string | null>(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  // Hard block from the pre-run balance gate on a home submit (empty wallet
+  // or signed out); non-null renders the AmrBalanceDialog on the home page —
+  // the project is never created, so the composer draft stays put. The dialog
+  // resolves the promise the submit handler is awaiting: 'retry' (sign-in
+  // completed / recharge landed) re-runs the gate and continues the very same
+  // create-and-run; 'dismiss' hands the composer back to the user.
+  const [amrBalanceGateBlock, setAmrBalanceGateBlock] = useState<
+    {
+      reason: 'insufficient' | 'signed_out';
+      snapshot: AmrWalletSnapshot;
+      resolve: (decision: 'retry' | 'dismiss') => void;
+    } | null
+  >(null);
+  // Soft low-balance warning holding a pending home submit: the dialog
+  // resolves the promise the submit handler is awaiting ('proceed' continues
+  // the very same create-and-run).
+  const [amrLowBalanceWarn, setAmrLowBalanceWarn] = useState<
+    {
+      snapshot: AmrWalletSnapshot;
+      resolve: (decision: AmrLowBalanceDecision) => void;
+    } | null
+  >(null);
+  useEffect(() => {
+    if (view !== 'design-systems') return;
+    void onDesignSystemsRefresh?.();
+  }, [onDesignSystemsRefresh, view]);
   // The entry nav rail is collapsed by default (Manus-style) so the entry
   // view opens clean and full-width; the panel toggle in the topbar opens it
   // as an overlay that dismisses on selection / backdrop click / Escape.
@@ -506,7 +611,19 @@ export function EntryShell({
     useState<CreateTab>('prototype');
   const [integrationTab, setIntegrationTab] = useState<IntegrationTab>(integrationInitialTab);
   const [homePromptHandoff, setHomePromptHandoff] = useState<HomePromptHandoff | null>(null);
+  // Personalized first-run starting point. Computed once, in memory, when the
+  // user finishes the About-you survey with real answers (see
+  // `finishOnboarding`); null for returning users, skipped/blank surveys, and
+  // after any page refresh (deliberately not persisted, per onboarding spec
+  // §7.1). Cleared as soon as the user takes any concrete entry (spec §7.4).
+  const [onboardingRec, setOnboardingRec] = useState<Recommendation | null>(null);
   const entryMainScrollRef = useRef<HTMLElement | null>(null);
+  // Entry views share this element, so route changes must not inherit the previous view's offset.
+  useLayoutEffect(() => {
+    const scrollContainer = entryMainScrollRef.current;
+    if (!scrollContainer) return;
+    scrollContainer.scrollTop = 0;
+  }, [view]);
   const analytics = useAnalytics();
   const discordOnlineLabel = discordPresence
     ? t('entry.discordOnlineLabel', {
@@ -569,10 +686,17 @@ export function EntryShell({
     setNewProjectOpen(true);
   }
 
-  const previewSystem = useMemo(
-    () => (previewSystemId ? designSystems.find((d) => d.id === previewSystemId) ?? null : null),
-    [designSystems, previewSystemId],
-  );
+  function startBlankProjectFromRail() {
+    void Promise.resolve(
+      onCreateProject({
+        name: t('common.untitled'),
+        skillId: null,
+        designSystemId: null,
+      }),
+    ).catch((err) => {
+      console.warn('Failed to create blank project from entry rail', err);
+    });
+  }
 
   function handleCreate(input: CreateInput) {
     // The NewProjectModal no longer asks the user to pick a plugin.
@@ -582,6 +706,9 @@ export function EntryShell({
     // is intentionally explicit so future kind-specific scenarios
     // (e.g. a deck- or image-specialized pipeline) can take over a
     // single row without touching the form.
+    // New-project modal / template / import is a concrete entry — retire any
+    // pending Home recommendation (spec §7.1 / §7.4).
+    dismissRecommendation();
     const pluginId = defaultPluginIdForMetadata(input.metadata);
     const pluginInputs = defaultPluginInputsForCreate(input, pluginId);
     return onCreateProject({
@@ -603,12 +730,57 @@ export function EntryShell({
   // `projectKind` on the payload so the created project records the
   // chosen surface (image / video / audio, etc.). Free-form Home
   // submits now arrive with the hidden od-default router plugin and
-  // projectKind='other', so the agent asks for the exact task type
-  // before continuing.
-  // Forwards onCreateProject's result so HomeView can hold its sending
-  // state until the creation roundtrip settles, and recover on failure
-  // (#4082).
-  function handlePluginLoopSubmit(payload: PluginLoopSubmit): Promise<boolean> | boolean | void {
+  // projectKind='other', so the agent infers the task type and asks only
+  // when the brief cannot be routed reliably.
+  async function handlePluginLoopSubmit(payload: PluginLoopSubmit) {
+    // Open Design Cloud pre-run balance gate: hard blocks (empty wallet or
+    // signed out) and the soft low-balance reminder both fire BEFORE the
+    // project is created, so the dialog appears right here on the home page
+    // and the composer keeps its draft. In-project sends are gated separately
+    // in ProjectView.handleSend.
+    let amrGatePrechecked = false;
+    if (config.mode === 'daemon' && config.agentId === 'amr') {
+      let gate = await checkAmrBalanceGate();
+      // Hard blocks hold THIS submit open: the dialog resolves 'retry' when
+      // its blocking condition clears (sign-in completed, recharge landed)
+      // and the gate re-runs, so the task auto-continues through the normal
+      // accept path. Still hard after the re-check (e.g. signed in but the
+      // wallet is empty) → the dialog re-shows with the fresh snapshot.
+      while (gate.kind === 'hard') {
+        const blocked = gate;
+        const decision = await new Promise<'retry' | 'dismiss'>((resolve) => {
+          setAmrBalanceGateBlock({
+            reason: blocked.reason,
+            snapshot: blocked.snapshot,
+            resolve,
+          });
+        });
+        setAmrBalanceGateBlock(null);
+        if (decision === 'dismiss') return 'blocked' as const;
+        gate = await checkAmrBalanceGate();
+      }
+      if (gate.kind === 'soft') {
+        // Hold THIS submit while the reminder waits for a decision; 'proceed'
+        // resumes the same create-and-run below, so HomeView's normal accept
+        // path (draft clearing, context consumption) still applies.
+        const plan = await resolveAmrPlan(gate.snapshot);
+        if (isPaidAmrPlan(plan)) {
+          const decision = await new Promise<AmrLowBalanceDecision>((resolve) => {
+            setAmrLowBalanceWarn({ snapshot: gate.snapshot, resolve });
+          });
+          setAmrLowBalanceWarn(null);
+          if (decision !== 'proceed') return 'blocked' as const;
+        }
+      }
+      // The decision (or clean pass) carries into the created project's first
+      // auto-send, which must not re-prompt what the user just answered.
+      amrGatePrechecked = true;
+    }
+    // Starting from the Home composer is a concrete entry — retire the
+    // recommendation (spec §7.4). Done only once the submit actually proceeds
+    // to create (past any AMR balance gate) so a blocked/cancelled submit
+    // leaves the recommendation intact for the user.
+    dismissRecommendation();
     const summarizedName = summarizeProjectNameFromPrompt(payload.prompt);
     const head = payload.prompt.trim().split(/\s+/).slice(0, 8).join(' ');
     const firstAttachmentName = payload.attachments?.[0]?.name ?? '';
@@ -618,6 +790,14 @@ export function EntryShell({
       payload.pluginTitle && payload.pluginTitle.trim().length > 0
         ? payload.pluginTitle.trim()
         : fallbackName;
+    const linkedDirs = Array.from(
+      new Set(
+        [
+          ...(payload.workingDir ? [payload.workingDir] : []),
+          ...(payload.linkedDirs ?? []),
+        ].map((dir) => dir.trim()).filter(Boolean),
+      ),
+    );
     const metadata: ProjectMetadata = {
       ...(payload.projectMetadata ?? {}),
       kind: payload.projectKind ?? payload.projectMetadata?.kind ?? 'prototype',
@@ -637,7 +817,7 @@ export function EntryShell({
       // project's `linkedDirs` rather than its `baseDir`/`userWorkingDir`:
       // Design Files stays the managed `.od/projects/<id>` artifact store,
       // independent of the user's local files.
-      ...(payload.workingDir ? { linkedDirs: [payload.workingDir] } : {}),
+      ...(linkedDirs.length > 0 ? { linkedDirs } : {}),
       ...(payload.examplePromptContext ? {
         examplePrompt: true,
         examplePromptTitle: payload.examplePromptContext.title,
@@ -656,6 +836,7 @@ export function EntryShell({
         ? { appliedPluginSnapshotId: payload.appliedPluginSnapshotId }
         : {}),
       ...(payload.pluginInputs ? { pluginInputs: payload.pluginInputs } : {}),
+      ...(payload.initialRunContext ? { initialRunContext: payload.initialRunContext } : {}),
       ...(payload.conversationMode ? { conversationMode: payload.conversationMode } : {}),
       ...(payload.attachments && payload.attachments.length > 0
         ? { pendingFiles: payload.attachments }
@@ -665,12 +846,65 @@ export function EntryShell({
       // not need the desktop main-process trust token that baseDir imports
       // require for write access.
       autoSendFirstMessage: true,
+      amrGatePrechecked,
     });
   }
 
-  function finishOnboarding() {
+  // Called when the welcome flow ends. `survey` is present on the About-you
+  // completion paths; we only build a recommendation when the user actually
+  // provided a role or use-case, so a skipped/blank survey lands on the
+  // generic Home entry (spec §6.2 / §7.1).
+  function finishOnboarding(survey?: { role: string; useCases: string[] }) {
+    if (survey && (survey.role.trim() || survey.useCases.length > 0)) {
+      setOnboardingRec(buildRecommendation(survey));
+    }
     onCompleteOnboarding();
     changeView('home');
+  }
+
+  // Drop the personalized recommendation. Fired when the user browses all
+  // types, or as soon as they take any other concrete entry, so Home never
+  // re-shows a recommendation the user has moved past (spec §7.4).
+  function dismissRecommendation() {
+    setOnboardingRec((current) => (current ? null : current));
+  }
+
+  // "进入 Studio" from the Home recommendation. Creates the project with the
+  // recommended first request pre-filled into the composer but NOT auto-sent —
+  // the user keeps control and can edit or clear it (spec §7.4 / §8.2).
+  async function handleRecommendationStart(input: {
+    name: string;
+    prompt: string;
+    metadata: ProjectMetadata;
+    onboardingEntry: OnboardingEntry;
+  }): Promise<boolean> {
+    const pluginId = defaultPluginIdForMetadata(input.metadata);
+    // Create FIRST, then tear down the recommendation only once it actually
+    // opened. Dismissing up-front turned a transient create/navigation failure
+    // into an onboarding dead-end: the user dropped back to generic Home with
+    // no way to retry the starter they just picked. On failure we keep the
+    // recommendation mounted. The onboarding entry rides along so the create
+    // success path stashes it keyed by the created project id — nothing is
+    // written on failure.
+    //
+    // Do NOT swallow the failure here: `onCreateProject` throws on real create
+    // failures, and a silent `catch` would leave the CTA looking clickable with
+    // no feedback. Let the error propagate so Home surfaces it in the same
+    // error channel the other entry actions use (HomeView owns `setError`), and
+    // return `false` for a clean no-project result so the caller can retry.
+    const ok =
+      (await onCreateProject({
+        name: input.name,
+        skillId: null,
+        designSystemId: null,
+        metadata: input.metadata,
+        pendingPrompt: input.prompt,
+        ...(pluginId ? { pluginId } : {}),
+        autoSendFirstMessage: false,
+        onboardingEntry: input.onboardingEntry,
+      })) !== false;
+    if (ok) dismissRecommendation();
+    return ok;
   }
 
   const avatarMenu = (
@@ -706,9 +940,15 @@ export function EntryShell({
             onApiProtocolChange={onApiProtocolChange}
             onApiModelChange={onApiModelChange}
             onConfigPersist={onConfigPersist}
+            {...(onPersistByokCredential ? { onPersistByokCredential } : {})}
             onRefreshAgents={onRefreshAgents}
             onFinish={finishOnboarding}
             onThemeChange={onThemeChange}
+            onGoBuild={() => {
+              onCompleteOnboarding();
+              setPendingDesignSystemCreateEntry('onboarding');
+              navigate({ kind: 'design-system-create' });
+            }}
           />
         </main>
       </div>
@@ -730,6 +970,22 @@ export function EntryShell({
       onOpenSettings={onOpenSettings}
     />
   );
+  const homeExecutionSwitcher = (
+    <InlineModelSwitcher
+      compact
+      config={config}
+      agents={agents}
+      providerModelsCache={activeProviderModelsCache}
+      onProviderModelsCacheChange={activeSetProviderModelsCache}
+      daemonLive={daemonLive}
+      onModeChange={onModeChange}
+      onAgentChange={onAgentChange}
+      onAgentModelChange={onAgentModelChange}
+      onApiProtocolChange={onApiProtocolChange}
+      onApiModelChange={onApiModelChange}
+      onOpenSettings={onOpenSettings}
+    />
+  );
 
   return (
     <div className="entry-shell entry-shell--no-header">
@@ -737,7 +993,14 @@ export function EntryShell({
         <EntryNavRail
           view={view}
           onViewChange={changeView}
-          onNewProject={() => openNewProject()}
+          onNewProject={() => {
+            trackHomeNavClick(analytics.track, {
+              page_name: 'home',
+              area: 'nav',
+              element: 'new_project_plus',
+            });
+            openNewProject();
+          }}
           open={railOpen}
           onClose={() => setRailOpen(false)}
         />
@@ -755,6 +1018,32 @@ export function EntryShell({
             </button>
             <div className="entry-main__topbar-chips entry-main__topbar-chips--icon-only">
               <GithubStarBadge />
+              <a
+                className="entry-workspace-chip od-tooltip"
+                href={enterpriseUrl(uiLocale)}
+                target="_blank"
+                rel="noreferrer noopener"
+                onClick={() => {
+                  trackHomeToolbarClick(analytics.track, {
+                    page_name: 'home',
+                    area: 'toolbar',
+                    element: 'workspace_teams',
+                  });
+                }}
+                data-tooltip={t('entry.workspaceTeamsTitle')}
+                data-tooltip-placement="bottom"
+                aria-label={t('entry.workspaceTeamsAria')}
+                data-testid="entry-workspace-teams"
+              >
+                <Icon
+                  name="sparkles"
+                  size={14}
+                  className="entry-workspace-chip__icon"
+                />
+                <span className="entry-workspace-chip__label">
+                  {t('entry.workspaceTeamsLabel')}
+                </span>
+              </a>
               <a
                 className="entry-discord-badge od-tooltip"
                 href={DISCORD_URL}
@@ -776,7 +1065,7 @@ export function EntryShell({
                   </>
                 ) : null}
               </a>
-              {executionSwitcher}
+              {view === 'home' ? null : executionSwitcher}
               <button
                 type="button"
                 className="use-everywhere-chip od-tooltip"
@@ -801,8 +1090,41 @@ export function EntryShell({
                 </span>
               </button>
             </div>
-            <UpdaterPopup />
+            <UpdaterPopup
+              allowSilentUpdates={config.allowSilentUpdates}
+              silentUpdatePreferenceReady={daemonAppConfigReady}
+              onAllowSilentUpdatesChange={
+                onSilentUpdatePreferenceChange
+                  ?? ((allowSilentUpdates) => onConfigPersist({ ...config, allowSilentUpdates }))
+              }
+            />
+            <WhatsNewPopup active={view === 'home'} />
+            <MessageCenter
+              onOpenNotificationSettings={() => onOpenSettings('notifications')}
+            />
             {avatarMenu}
+            {amrBalanceGateBlock ? (
+              <AmrBalanceDialog
+                reason={amrBalanceGateBlock.reason}
+                balanceUsd={amrBalanceGateBlock.snapshot.balanceUsd}
+                profile={amrBalanceGateBlock.snapshot.profile}
+                entrySource="home_balance_gate_upgrade"
+                metricsConsent={config.telemetry?.metrics === true}
+                installationId={config.installationId}
+                onClose={() => amrBalanceGateBlock.resolve('dismiss')}
+                onResolved={() => amrBalanceGateBlock.resolve('retry')}
+              />
+            ) : null}
+            {amrLowBalanceWarn ? (
+              <AmrLowBalanceDialog
+                balanceUsd={amrLowBalanceWarn.snapshot.balanceUsd}
+                profile={amrLowBalanceWarn.snapshot.profile}
+                entrySource="home_low_balance_warn_recharge"
+                metricsConsent={config.telemetry?.metrics === true}
+                installationId={config.installationId}
+                onDecision={amrLowBalanceWarn.resolve}
+              />
+            ) : null}
           </div>
           <div
             className={`entry-main__inner${
@@ -819,17 +1141,26 @@ export function EntryShell({
                 onSubmit={handlePluginLoopSubmit}
                 onOpenProject={onOpenProject}
                 onViewAllProjects={() => changeView('projects')}
+                onDeleteProject={onDeleteProject}
+                onDuplicateProject={onDuplicateProject}
+                onRenameProject={onRenameProject}
                 onBrowseRegistry={() => changeView('plugins')}
                 onOpenIntegrations={() => openIntegrationTab('connectors')}
                 onOpenMcp={() => openIntegrationTab('mcp')}
                 onOpenNewProject={(tab) => {
                   openNewProject(tab);
                 }}
+                onStartBlankProject={startBlankProjectFromRail}
                 promptHandoff={homePromptHandoff}
                 skills={skills}
                 skillsLoading={skillsLoading}
                 connectors={connectors}
                 promptTemplates={promptTemplates}
+                recommendation={onboardingRec}
+                onRecommendationStart={handleRecommendationStart}
+                onRecommendationDismiss={dismissRecommendation}
+                executionSwitcher={view === 'home' ? homeExecutionSwitcher : undefined}
+                artifactUpgradeSlot={artifactUpgradeSlot}
               />
             </div>
             <div data-testid="entry-view-projects" data-active={view === 'projects' ? 'true' : 'false'} {...inactiveViewProps(view === 'projects')}>
@@ -847,10 +1178,13 @@ export function EntryShell({
                     onOpen={onOpenProject}
                     onOpenLiveArtifact={onOpenLiveArtifact}
                     onDelete={onDeleteProject}
+                    onDuplicate={onDuplicateProject}
                     onRename={onRenameProject}
-                    onNewProject={() => openNewProject()}
                     onRefresh={onProjectsRefresh}
                     isActive={view === 'projects'}
+                    onNewProject={() => {
+                      openNewProject();
+                    }}
                   />
                 </div>
               )}
@@ -872,7 +1206,21 @@ export function EntryShell({
             </div>
             <div data-testid="entry-view-design-systems" data-active={view === 'design-systems' ? 'true' : 'false'} {...inactiveViewProps(view === 'design-systems')}>
               {designSystemsLoading ? (
-                <CenteredLoader label={t('common.loading')} />
+                <div className="entry-section">
+                  <header className="entry-section__head">
+                    <h1 className="entry-section__title">{t('entry.navDesignSystems')}</h1>
+                  </header>
+                  <DesignSystemsTab
+                    loading
+                    systems={[]}
+                    templates={templates}
+                    selectedId={defaultDesignSystemId}
+                    onSelect={onChangeDefaultDesignSystem}
+                    onCreate={onCreateDesignSystem}
+                    onOpenSystem={onOpenDesignSystem}
+                    onSystemsRefresh={onDesignSystemsRefresh}
+                  />
+                </div>
               ) : (
                 <div className="entry-section">
                   <header className="entry-section__head">
@@ -886,15 +1234,25 @@ export function EntryShell({
                     onCreate={onCreateDesignSystem}
                     onOpenSystem={onOpenDesignSystem}
                     onSystemsRefresh={onDesignSystemsRefresh}
-                    onPreview={(id) => setPreviewSystemId(id)}
                   />
                 </div>
               )}
             </div>
+            {LIBRARY_UI_VISIBLE ? (
+              <div data-testid="entry-view-library" data-active={view === 'library' ? 'true' : 'false'} {...inactiveViewProps(view === 'library')}>
+                <LibrarySection
+                  active={view === 'library'}
+                  onOpenProject={(projectId, fileName) =>
+                    navigate({ kind: 'project', projectId, conversationId: null, fileName: fileName ?? null })
+                  }
+                />
+              </div>
+            ) : null}
             <div data-testid="entry-view-brands" data-active={view === 'brands' ? 'true' : 'false'} {...inactiveViewProps(view === 'brands')}>
               <BrandsTab
                 onApplyDesignSystem={onChangeDefaultDesignSystem}
                 onOpenProject={onOpenProject}
+                onDesignSystemsRefresh={onDesignSystemsRefresh}
               />
             </div>
             {view === 'integrations' ? (
@@ -902,24 +1260,20 @@ export function EntryShell({
                 config={config}
                 initialTab={integrationTab}
                 composioConfigLoading={composioConfigLoading}
+                onConfigPersist={onConfigPersist}
                 onPersistComposioKey={onPersistComposioKey}
+                onSkillsRefresh={onSkillsRefresh}
+                onSkillsChanged={onSkillsChanged}
               />
             ) : null}
           </div>
         </main>
       </div>
-      <AnimatePresence>
-        {previewSystem ? (
-          <DesignSystemPreviewModal
-            system={previewSystem}
-            onClose={() => setPreviewSystemId(null)}
-          />
-        ) : null}
-      </AnimatePresence>
       <NewProjectModal
         open={newProjectOpen}
         initialTab={newProjectInitialTab}
         skills={skills}
+        designTemplates={designTemplates}
         designSystems={designSystems}
         defaultDesignSystemId={defaultDesignSystemId}
         templates={templates}
@@ -956,9 +1310,11 @@ function OnboardingView({
   onApiProtocolChange,
   onApiModelChange,
   onConfigPersist,
+  onPersistByokCredential,
   onRefreshAgents,
   onFinish,
   onThemeChange,
+  onGoBuild,
 }: {
   config: AppConfig;
   providerModelsCache?: ProviderModelsCache;
@@ -970,14 +1326,20 @@ function OnboardingView({
   onAgentChange: (id: string) => void;
   onAgentModelChange: (
     id: string,
-    choice: { model?: string; reasoning?: string },
+    choice: { model?: string; reasoning?: string; serviceTier?: string },
   ) => void;
   onApiProtocolChange: (protocol: ApiProtocol) => void;
   onApiModelChange: (model: string) => void;
   onConfigPersist: (cfg: AppConfig) => Promise<void> | void;
+  onPersistByokCredential?: (
+    input: UpsertByokCredentialProfileRequest,
+  ) => Promise<ByokCredentialProfile>;
   onRefreshAgents: () => Promise<AgentInfo[]> | AgentInfo[];
-  onFinish: () => void;
+  // `survey` is passed on the About-you completion paths (not on skip) so the
+  // shell can build a personalized Home recommendation.
+  onFinish: (survey?: { role: string; useCases: string[] }) => void;
   onThemeChange: (theme: AppTheme) => void;
+  onGoBuild: () => void;
 }) {
   const t = useT();
   const analytics = useAnalytics();
@@ -989,66 +1351,16 @@ function OnboardingView({
   // straight from the landing's primary button.
   const [connectExpanded, setConnectExpanded] = useState<'local' | 'byok' | null>(null);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
+  const [byokPersistPending, setByokPersistPending] = useState(false);
   const [cliScanStatus, setCliScanStatus] = useState<'idle' | 'scanning' | 'done'>('idle');
   const [amrStatus, setAmrStatus] = useState<VelaLoginStatus | null>(null);
-  // 初始登录状态是否已拉到（无论登录与否）。登录页按钮用它判断是否还在「加载中…」。
+  // Initial login status fetch has settled, whether signed in or not. The
+  // cloud landing uses this to avoid flashing "Sign in" before flipping to
+  // "Continue" for already-authenticated users.
   const [amrStatusResolved, setAmrStatusResolved] = useState(false);
-  // True while the one-shot AMR re-probe (fired when the cold-start stream
-  // settled without surfacing AMR) is in flight. Combined with
-  // `agentsLoading`, this is the full window during which AMR availability
-  // is still undecided — and the AMR cloud card renders its skeleton.
   const [amrLoginPending, setAmrLoginPending] = useState(false);
   const [amrLoginCancelPending, setAmrLoginCancelPending] = useState(false);
   const [newsletterSubmitting, setNewsletterSubmitting] = useState(false);
-  // Optional brand extraction on the final onboarding step. The hook
-  // drives a 3-stage SSE progress model against POST /api/brands; the
-  // local URL string is the only extra state the panel needs. Extraction
-  // is entirely optional — it never blocks the Finish/Continue button
-  // (see handlePrimaryAction, which has no brand awareness).
-  const [brandUrl, setBrandUrl] = useState('');
-  const {
-    state: brandExtractState,
-    run: runBrandExtract,
-  } = useBrandExtract();
-  const brandExtractActive = brandExtractState.phase === 'starting';
-  const brandExtractDone = brandExtractState.phase === 'done';
-  const brandExtractFailed = brandExtractState.phase === 'error';
-  // Clicking Extract here behaves exactly like the Brands tab: stand up the
-  // extraction project, then finish onboarding and open it so the agent runs
-  // the extraction live (with a browser tab on the target site).
-  const handleOnboardingBrandExtract = useCallback(
-    async (explicitUrl?: string) => {
-      // An explicit URL (a picked reference brand) wins over the input, whose
-      // state update may not have committed yet when the picker fires.
-      const trimmed = (explicitUrl ?? brandUrl).trim();
-      if (!trimmed || brandExtractActive) return;
-      const result = await runBrandExtract(trimmed);
-      if (!result) return;
-      try {
-        window.sessionStorage.setItem(`od:auto-send-first:${result.projectId}`, '1');
-      } catch {
-        // Private-mode storage failures should not block navigation.
-      }
-      onFinish();
-      navigate({
-        kind: 'project',
-        projectId: result.projectId,
-        fileName: null,
-        conversationId: result.conversationId,
-      });
-    },
-    [brandUrl, brandExtractActive, runBrandExtract, onFinish],
-  );
-
-  // The onboarding picker fills the URL field and immediately starts extraction.
-  const handleOnboardingPickReference = useCallback(
-    (brand: BrandReference) => {
-      if (brandExtractActive) return;
-      setBrandUrl(brand.domain);
-      void handleOnboardingBrandExtract(brand.domain);
-    },
-    [brandExtractActive, handleOnboardingBrandExtract],
-  );
   const [amrLoginError, setAmrLoginError] = useState<string | null>(null);
   const [visibleAgentIds, setVisibleAgentIds] = useState<string[]>([]);
   const [providerTestState, setProviderTestState] = useState<
@@ -1056,6 +1368,9 @@ function OnboardingView({
     | { status: 'running'; inputKey: string }
     | { status: 'done'; inputKey: string; result: ConnectionTestResponse }
   >({ status: 'idle' });
+  const [agentTestState, setAgentTestState] = useState<OnboardingAgentTestState>({
+    status: 'idle',
+  });
   const [providerModelsState, setProviderModelsState] = useState<
     | { status: 'idle' }
     | { status: 'running'; inputKey: string }
@@ -1078,6 +1393,7 @@ function OnboardingView({
     orgSize: '',
     useCase: [] as string[],
     source: '',
+    sourceOther: '',
     email: '',
   });
   // Live mirror of `profile` so closures that fire faster than React
@@ -1093,6 +1409,20 @@ function OnboardingView({
   useEffect(() => {
     profileRef.current = profile;
   }, [profile]);
+  // Update the About-you profile through this helper (not `setProfile`
+  // directly) whenever the value feeds an imperative read. It mirrors the new
+  // value into `profileRef.current` synchronously, so paths that read the live
+  // ref before React's state→ref sync effect runs — `emitAboutYouSubmit`, the
+  // Memory note, the newsletter submit — never see a stale field even when the
+  // user changes an answer and immediately continues.
+  const updateProfile = useCallback(
+    (producer: (current: OnboardingProfileState) => OnboardingProfileState) => {
+      const next = producer(profileRef.current);
+      profileRef.current = next;
+      setProfile(next);
+    },
+    [],
+  );
   const agentRevealTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const cliScanTokenRef = useRef(0);
   const cliScanTelemetryRef = useRef<{
@@ -1102,6 +1432,9 @@ function OnboardingView({
   } | null>(null);
   const cliRefreshPendingTokenRef = useRef<number | null>(null);
   const amrLoginPollCancelledRef = useRef(false);
+  const amrLoginStartPendingRef = useRef(false);
+  const amrLoginCancelRequestedRef = useRef(false);
+  const amrAuthAttemptIdRef = useRef<string | null>(null);
   const amrAgentRefreshAttemptedRef = useRef(false);
   const providerModelsAutoFetchKeyRef = useRef<string | null>(null);
   const providerAutoTestKeyRef = useRef<string | null>(null);
@@ -1154,7 +1487,10 @@ function OnboardingView({
   const selectedProvider = KNOWN_PROVIDERS.find(
     (provider) =>
       provider.protocol === apiProtocol &&
-      provider.baseUrl === (config.apiProviderBaseUrl ?? config.baseUrl),
+      (
+        provider.baseUrl === (config.apiProviderBaseUrl ?? config.baseUrl) ||
+        (apiProtocol === 'azure' && provider.baseUrl === '' && Boolean(config.baseUrl?.trim()))
+      ),
   ) ?? null;
   const availableCliAgents = agents.filter((agent) => agent.available && agent.id !== 'amr');
   const visibleAgents = availableCliAgents.filter((agent) => visibleAgentIds.includes(agent.id));
@@ -1163,6 +1499,21 @@ function OnboardingView({
   const amrSelectedAndSignedOut = runtime === 'amr' && !amrSignedIn;
   const selectedAgent = visibleAgents.find((agent) => agent.id === config.agentId) ?? null;
   const selectedAgentChoice = selectedAgent ? (config.agentModels?.[selectedAgent.id] ?? {}) : {};
+  const normalizedSelectedAgentChoice = effectiveAgentModelChoice(selectedAgent, selectedAgentChoice) ?? selectedAgentChoice;
+  const selectedAgentTestModel = normalizedSelectedAgentChoice.model ?? defaultAgentModelId(selectedAgent) ?? '';
+  const selectedAgentTestReasoning = selectedAgentChoice.reasoning ?? '';
+  const agentTestInputKey = [
+    selectedAgent?.id ?? '',
+    selectedAgentTestModel,
+    selectedAgentTestReasoning,
+    JSON.stringify(config.agentCliEnv ?? {}),
+  ].join('\n');
+  const visibleAgentTestState =
+    agentTestState.status === 'running' ||
+    (agentTestState.status !== 'idle' && agentTestState.inputKey === agentTestInputKey)
+      ? agentTestState
+      : { status: 'idle' as const };
+  const canTestAgent = Boolean(selectedAgent) && daemonLive;
   // Connect-step (step 0) gate. Continue may only advance once the selected
   // runtime is actually usable: AMR signed in, an available local CLI chosen,
   // or a BYOK provider whose connection test passed. AMR-selected-but-signed-out
@@ -1259,8 +1610,8 @@ function OnboardingView({
   }, [amrAgent, agentsLoading, onRefreshAgents]);
 
   useEffect(() => {
-    // 挂载时立即拉取登录状态（与 agent 列表加载并行，不再等 amrAgent），
-    // 让登录页按钮尽快从「加载中…」settle 到「登录」/「继续（已登录）」。
+    // Fetch login status on mount in parallel with agent discovery so the
+    // landing CTA settles quickly for already-authenticated users.
     let cancelled = false;
     void fetchVelaLoginStatus()
       .then((next) => {
@@ -1286,9 +1637,9 @@ function OnboardingView({
   // onboarding and remains available from the app surfaces.
   //
   // We do NOT clear on unmount: route changes can remount the shell
-  // during first-run setup. Back / last-step Continue clear inline in
-  // their respective handlers below; abandoned sessions clear on
-  // sessionStorage tab close.
+  // during first-run setup. Skip / Back / last-step Continue clear
+  // inline in their respective handlers below; abandoned sessions clear
+  // on sessionStorage tab close.
   const onboardingSessionIdRef = useRef<string>('');
   if (!onboardingSessionIdRef.current) {
     onboardingSessionIdRef.current = getOrCreateOnboardingSessionId();
@@ -1310,8 +1661,9 @@ function OnboardingView({
   // result event can carry `duration_ms`; `runtime` state is the user's
   // current pick at click time so `runtime_type` rides along on every
   // click. The `_lifecycleReportedRef` guards against double-firing the
-  // completion event if a submit path and unmount happen in the same tick
-  // (the unmount path also clears the session id; see the PR #2453 follow-up).
+  // completion event when the user fires both Skip and unmount in the
+  // same tick (the unmount path also clears the session id; see the
+  // PR #2453 follow-up).
   const onboardingStartedAtRef = useRef<number>(Date.now());
   const lifecycleReportedRef = useRef(false);
   // Guards `about_you_submit` to exactly one emit per onboarding session,
@@ -1332,7 +1684,7 @@ function OnboardingView({
     if (stepIdx === 0) return { area: 'runtime', stepIndex: '1', stepName: 'connect' };
     if (stepIdx === 1) return { area: 'about_you', stepIndex: '2', stepName: 'about_you' };
     if (stepIdx === 2) return { area: 'newsletter', stepIndex: '3', stepName: 'newsletter' };
-    return { area: 'brand', stepIndex: '4', stepName: 'brand_extract' };
+    return { area: 'design_system', stepIndex: '4', stepName: 'design_system' };
   }
   function emitOnboardingClick(
     element: TrackingOnboardingClickElement,
@@ -1418,18 +1770,17 @@ function OnboardingView({
         use_cases: liveProfile.useCase.length > 0
           ? liveProfile.useCase
           : ['unknown'],
+        // Only the enumerated bucket ships to analytics. The raw "Other"
+        // free-text is deliberately NOT forwarded here: analytics events must
+        // stay free-text/PII-free (see the contract note on OnboardingClickProps),
+        // and the scrubber does not sanitize arbitrary event properties. The
+        // typed detail lives only in app-owned local storage (Memory note).
         discovery_source: liveProfile.source || 'unknown',
       } : {}),
     });
   }
 
-  const steps = [
-    t('settings.onboardingStepConnect'),
-    t('settings.onboardingStepProfile'),
-    t('settings.onboardingStepNewsletter'),
-    t('newBrand.extract'),
-  ];
-  const isLastStep = step === steps.length - 1;
+  const isLastStep = step === 3;
 
   const roleOptions = [
     { value: 'agency', label: t('settings.onboardingRoleAgency') },
@@ -1463,16 +1814,20 @@ function OnboardingView({
     { value: 'agency', label: t('settings.onboardingUseAgency') },
   ];
   const sourceOptions = [
+    { value: 'x', label: t('settings.onboardingSourceX') },
     { value: 'github', label: t('settings.onboardingSourceGithub') },
-    { value: 'friend', label: t('settings.onboardingSourceFriend') },
-    { value: 'social', label: t('settings.onboardingSourceSocial') },
-    { value: 'product-hunt', label: t('settings.onboardingSourceProductHunt') },
-    { value: 'community', label: t('settings.onboardingSourceCommunity') },
     { value: 'youtube', label: t('settings.onboardingSourceYoutube') },
-    { value: 'blog', label: t('settings.onboardingSourceBlog') },
-    { value: 'ai-tool', label: t('settings.onboardingSourceAiTool') },
+    { value: 'tiktok', label: t('settings.onboardingSourceTiktok') },
+    { value: 'reddit', label: t('settings.onboardingSourceReddit') },
+    { value: 'linkedin', label: t('settings.onboardingSourceLinkedin') },
+    { value: 'meta_social', label: t('settings.onboardingSourceMetaSocial') },
     { value: 'search', label: t('settings.onboardingSourceSearch') },
-    { value: 'event', label: t('settings.onboardingSourceEvent') },
+    { value: 'ai_tool', label: t('settings.onboardingSourceAiTool') },
+    { value: 'friend', label: t('settings.onboardingSourceFriend') },
+    { value: 'community', label: t('settings.onboardingSourceCommunity') },
+    { value: 'email', label: t('settings.onboardingSourceEmail') },
+    { value: 'blog', label: t('settings.onboardingSourceBlog') },
+    { value: 'other', label: t('settings.onboardingSourceOther') },
   ];
 
   function cleanOnboardingOptionLabel(label: string): string {
@@ -1503,7 +1858,12 @@ function OnboardingView({
       ]);
     }
     if (snapshot.source) {
-      fields.push(['Discovery source', optionLabel(sourceOptions, snapshot.source)]);
+      const sourceLabel = optionLabel(sourceOptions, snapshot.source);
+      const custom = snapshot.source === 'other' ? snapshot.sourceOther.trim() : '';
+      fields.push([
+        'Discovery source',
+        custom ? `${sourceLabel} (${custom})` : sourceLabel,
+      ]);
     }
     return fields.map(([label, value]) => `- ${label}: ${value}`).join('\n');
   }
@@ -1531,9 +1891,14 @@ function OnboardingView({
     }
   }
 
+  const protocolProviders = KNOWN_PROVIDERS.filter((provider) => provider.protocol === apiProtocol);
+  const hasProtocolOwnedEmptyProvider =
+    apiProtocol === 'azure' && protocolProviders.some((provider) => provider.baseUrl === '');
   const byokProviderOptions = [
-    { value: '', label: t('settings.customProvider') },
-    ...KNOWN_PROVIDERS.filter((provider) => provider.protocol === apiProtocol).map((provider) => ({
+    ...(hasProtocolOwnedEmptyProvider
+      ? []
+      : [{ value: '', label: t('settings.customProvider') }]),
+    ...protocolProviders.map((provider) => ({
       value: provider.baseUrl,
       label: provider.label,
     })),
@@ -1547,7 +1912,9 @@ function OnboardingView({
     activeProviderModelsCache[providerModelsInputKey] ?? [];
   const byokModelOptions = mergeOnboardingProviderModelOptions(
     fetchedProviderModels,
-    SUGGESTED_MODELS_BY_PROTOCOL[apiProtocol],
+    selectedProvider?.preferredModels.length
+      ? selectedProvider.preferredModels
+      : SUGGESTED_MODELS_BY_PROTOCOL[apiProtocol],
     config.model,
   ).map((model) => ({
     value: model.id,
@@ -1584,14 +1951,12 @@ function OnboardingView({
     void onConfigPersist(nextConfig);
   }
 
-  function selectFirstProviderModelWhenEmpty(
+  function selectPreferredProviderModelWhenEmpty(
     models: readonly ProviderModelOption[],
     expectedInputKey: string,
   ) {
-    const firstModel = models[0];
     const current = providerModelAutoSelectRef.current;
     if (
-      !firstModel ||
       current.runtime !== 'byok' ||
       current.step !== 0 ||
       current.providerModelsInputKey !== expectedInputKey ||
@@ -1599,8 +1964,14 @@ function OnboardingView({
     ) {
       return;
     }
-    onApiModelChange(firstModel.id);
-    updateApiConfig({ model: firstModel.id });
+    const preference = resolveByokModelPreference({
+      currentModel: '',
+      accountModels: models,
+      providerPreferredModels: selectedProvider?.preferredModels ?? [],
+    });
+    if (!preference.model) return;
+    onApiModelChange(preference.model);
+    updateApiConfig({ model: preference.model });
   }
 
   function clearAgentRevealTimers() {
@@ -1703,7 +2074,7 @@ function OnboardingView({
     setStep((current) => current - 1);
   }
   async function handlePrimaryAction() {
-    if (newsletterSubmitting) return;
+    if (newsletterSubmitting || byokPersistPending) return;
     // Connect gate: the button is `aria-disabled` (not natively disabled, so it
     // can still surface its tooltip on hover), so guard the click here — a
     // blocked Continue must not advance past the Connect step.
@@ -1721,35 +2092,78 @@ function OnboardingView({
       void handleAmrSignInToContinue(attribution);
       return;
     }
-    if (isLastStep) {
-      // Emit the About-you survey snapshot on the completion path, before
-      // the continue/complete pair. Reading `profileRef` captures the
-      // user's final role / org size / use case / discovery source picks
-      // even on a fast Finish. Gating it here — rather than when the user
-      // leaves the About-you step — keeps it exactly-once no matter how the
-      // final step was reached: primary CTA, Back-then-Continue, or a
-      // forward jump via the clickable stepper. `emitAboutYouSubmit` is
-      // additionally idempotent per session (see its `aboutYouReportedRef`
-      // guard). The snapshot click + the survey fields on
-      // `onboarding_complete_result` give the funnel two independent
-      // carriers for the same data.
-      emitAboutYouSubmit();
-      void persistOnboardingProfileToMemory();
-      const newsletterEmail = profileRef.current.email;
-      const shouldSubmitNewsletter =
-        NEWSLETTER_EMAIL_RE.test(newsletterEmail.trim().toLowerCase());
-      if (shouldSubmitNewsletter) {
-        setNewsletterSubmitting(true);
-        await submitNewsletterEmail(newsletterEmail);
+    if (step === 0 && runtime === 'byok') {
+      if (!byokConnectionVerified) return;
+      if (apiProtocol === 'bedrock') {
+        setProviderTestState({
+          status: 'done',
+          inputKey: providerTestInputKey,
+          result: {
+            ok: false,
+            kind: 'unknown',
+            latencyMs: 0,
+            model: config.model,
+            detail: 'Secure BYOK profiles do not support the Bedrock protocol',
+          },
+        });
+        return;
       }
-      emitOnboardingClick('continue', 'continue');
-      // Last-step Continue without a DS generation = "completed
-      // without design system". The Generate path inside the
-      // embedded DesignSystemCreationFlow takes a different route
-      // (navigation to project) and emits its own completion.
-      emitOnboardingComplete('completed', 'completed_without_design_system');
-      clearOnboardingSessionId();
-      onFinish();
+      if (!onPersistByokCredential) {
+        setProviderTestState({
+          status: 'done',
+          inputKey: providerTestInputKey,
+          result: {
+            ok: false,
+            kind: 'unknown',
+            latencyMs: 0,
+            model: config.model,
+            detail: 'Secure BYOK credential storage is unavailable',
+          },
+        });
+        return;
+      }
+      setByokPersistPending(true);
+      try {
+        const profile = await onPersistByokCredential({
+          ...(config.byokProfileId ? { id: config.byokProfileId } : {}),
+          label: selectedProvider?.label ?? apiProtocol,
+          protocol: apiProtocol,
+          baseUrl: config.baseUrl.trim(),
+          model: config.model.trim(),
+          ...(apiProtocol === 'azure' && config.apiVersion?.trim()
+            ? { apiVersion: config.apiVersion.trim() }
+            : {}),
+          requiresApiKey: true,
+          apiKey: config.apiKey.trim(),
+        });
+        await onConfigPersist(applySavedByokCredentialProfile(config, profile));
+        emitOnboardingClick('continue', 'continue');
+        setStep((current) => current + 1);
+      } catch (error) {
+        setProviderTestState({
+          status: 'done',
+          inputKey: providerTestInputKey,
+          result: {
+            ok: false,
+            kind: 'unknown',
+            latencyMs: 0,
+            model: config.model,
+            detail: error instanceof Error
+              ? error.message
+              : 'Secure BYOK credential storage is unavailable',
+          },
+        });
+      } finally {
+        setByokPersistPending(false);
+      }
+      return;
+    }
+    if (isLastStep) {
+      await runOnboardingCompletion('completed_without_design_system');
+      onFinish({
+        role: profileRef.current.role,
+        useCases: profileRef.current.useCase,
+      });
       return;
     }
     emitOnboardingClick('continue', 'continue');
@@ -1760,10 +2174,9 @@ function OnboardingView({
   }
 
   // Cloud-landing primary CTA: pick the AMR cloud runtime and kick off the
-  // Open Design Cloud sign-in in one gesture. Mirrors the AMR card's
-  // selection side effects (mode/agent) followed by the AMR-sign-in path that
-  // the runtime chooser's gated Continue uses, so a successful login advances
-  // to the next onboarding step exactly the same way.
+  // Open Design Cloud sign-in in one gesture. Mirrors the old AMR card's
+  // selection side effects (mode/agent) followed by the sign-in path, so a
+  // successful login advances to the next onboarding step exactly the same way.
   async function handleCloudSignIn() {
     if (amrLoginPending || amrLoginCancelPending) return;
     const cardAttribution = recordAmrEntry(
@@ -1787,11 +2200,55 @@ function OnboardingView({
     await handleAmrSignInToContinue(attribution);
   }
 
+  // Shared finish work for the final step, independent of where the user lands
+  // next. Emits the About-you snapshot + completion analytics exactly once
+  // (both are idempotent per session), submits the newsletter if an email was
+  // entered, then clears the session. Reading `profileRef` captures the user's
+  // final picks even on a fast click before React commits the latest state.
+  // Callers pick the destination: home (`onFinish`) or the design-system
+  // create flow (`onGoBuild`).
+  // `completionType` distinguishes the final-step fork (C2, tracking spec §3.1):
+  // 'completed_with_design_system' when the user chose "Build a design system",
+  // 'completed_without_design_system' when they went straight Home. Lets the
+  // funnel measure how many users skip DS creation at onboarding.
+  async function runOnboardingCompletion(
+    completionType: TrackingOnboardingCompletionType,
+  ): Promise<void> {
+    emitAboutYouSubmit();
+    void persistOnboardingProfileToMemory();
+    const newsletterEmail = profileRef.current.email;
+    const shouldSubmitNewsletter =
+      NEWSLETTER_EMAIL_RE.test(newsletterEmail.trim().toLowerCase());
+    if (shouldSubmitNewsletter) {
+      setNewsletterSubmitting(true);
+      await submitNewsletterEmail(newsletterEmail);
+    }
+    emitOnboardingClick('continue', 'continue');
+    emitOnboardingComplete('completed', completionType);
+    clearOnboardingSessionId();
+  }
+
+  async function handleFinishToHome(): Promise<void> {
+    if (newsletterSubmitting) return;
+    await runOnboardingCompletion('completed_without_design_system');
+    onFinish({
+      role: profileRef.current.role,
+      useCases: profileRef.current.useCase,
+    });
+  }
+
+  async function handleFinishToBuild(): Promise<void> {
+    if (newsletterSubmitting) return;
+    await runOnboardingCompletion('completed_with_design_system');
+    onGoBuild();
+  }
+
   async function handleAmrSignInToContinue(
     attribution?: AmrEntryAttribution | null,
   ) {
     if (amrLoginPending || amrLoginCancelPending) return;
     amrLoginPollCancelledRef.current = false;
+    amrLoginCancelRequestedRef.current = false;
     setAmrLoginError(null);
     setAmrLoginPending(true);
     try {
@@ -1803,28 +2260,97 @@ function OnboardingView({
         return;
       }
       if (amrLoginPollCancelledRef.current) return;
-      beginAmrAuthTracking(attribution);
+      const provisionalAuthAttemptId = beginAmrAuthTracking(
+        attribution,
+        Date.now(),
+      );
+      amrAuthAttemptIdRef.current = provisionalAuthAttemptId;
       const odDeviceId = amrHandoffDeviceId({
         metricsConsent: config.telemetry?.metrics === true,
         resolvedDeviceId: getResolvedDeviceId(),
         installationId: config.installationId,
       });
-      const loginResult = await startVelaLogin(attribution, odDeviceId);
-      if (amrLoginPollCancelledRef.current) {
-        resolveAmrAuthTracking(analytics.track, 'cancelled');
+      amrLoginStartPendingRef.current = true;
+      const loginResult = await startVelaLogin(
+        attribution,
+        odDeviceId,
+        provisionalAuthAttemptId,
+      ).finally(() => {
+        amrLoginStartPendingRef.current = false;
+      });
+      const authAttemptId = reconcileAmrAuthAttemptId(
+        provisionalAuthAttemptId,
+        loginResult.authAttemptId,
+        { joinedExisting: loginResult.alreadyRunning === true },
+      );
+      amrAuthAttemptIdRef.current = authAttemptId;
+      if (loginResult.ok || loginResult.alreadyRunning) {
+        confirmAmrAuthTracking(analytics.track, authAttemptId, {
+          joinedExisting: loginResult.alreadyRunning === true,
+        });
+      }
+      observeAmrAuthTracking(analytics.track, loginResult, authAttemptId);
+      if (
+        amrLoginPollCancelledRef.current
+        || amrLoginCancelRequestedRef.current
+      ) {
         if (loginResult.ok || loginResult.alreadyRunning) {
-          const cancelResult = await cancelVelaLogin();
-          closeAmrActivationWindowBestEffort();
+          const cancelResult = await cancelVelaLogin(authAttemptId);
           if (!cancelResult.ok) {
+            amrLoginCancelRequestedRef.current = false;
+            setAmrLoginCancelPending(false);
             setAmrLoginError(t('settings.amrLoginErrorCompact'));
             return;
           }
-          notifyAmrLoginStatusChanged('login-canceled');
+          if (cancelResult.canceled !== true) {
+            const nextStatus = await fetchVelaLoginStatus();
+            if (nextStatus) {
+              setAmrStatus(nextStatus);
+              if (nextStatus.authAttemptId) {
+                amrAuthAttemptIdRef.current = nextStatus.authAttemptId;
+              }
+            }
+            amrLoginCancelRequestedRef.current = false;
+            amrLoginPollCancelledRef.current = false;
+            setAmrLoginCancelPending(false);
+            if (!nextStatus?.loginInFlight) return;
+          } else {
+            resolveAmrAuthTracking(analytics.track, 'cancelled', undefined, {
+              authAttemptId,
+            });
+            closeAmrActivationWindowBestEffort();
+            notifyAmrLoginStatusChanged('login-canceled');
+            amrLoginCancelRequestedRef.current = false;
+            amrLoginPollCancelledRef.current = true;
+            setAmrLoginCancelPending(false);
+            setAmrStatus((current) => (
+              current
+                ? { ...current, loggedIn: false, loginInFlight: false, user: null }
+                : current
+            ));
+            return;
+          }
+        } else {
+          resolveAmrAuthTracking(analytics.track, 'cancelled', undefined, {
+            authAttemptId,
+          });
+          if (amrLoginCancelRequestedRef.current) {
+            amrLoginCancelRequestedRef.current = false;
+            amrLoginPollCancelledRef.current = true;
+            setAmrLoginCancelPending(false);
+            setAmrStatus((current) => (
+              current
+                ? { ...current, loggedIn: false, loginInFlight: false, user: null }
+                : current
+            ));
+          }
+          return;
         }
-        return;
       }
       if (!loginResult.ok && !loginResult.alreadyRunning) {
-        resolveAmrAuthTracking(analytics.track, 'failed', 'spawn_failed');
+        resolveAmrAuthTracking(analytics.track, 'failed', 'spawn_failed', {
+          authAttemptId,
+        });
         setAmrLoginError(loginResult.error || t('settings.amrLoginErrorCompact'));
         return;
       }
@@ -1838,23 +2364,56 @@ function OnboardingView({
 
   async function handleCancelAmrLogin() {
     if (!amrLoginPending || amrLoginCancelPending) return;
-    amrLoginPollCancelledRef.current = true;
-    resolveAmrAuthTracking(analytics.track, 'cancelled');
+    const loginStartPending = amrLoginStartPendingRef.current;
+    const authAttemptId = amrAuthAttemptIdRef.current;
     setAmrLoginError(null);
     setAmrLoginCancelPending(true);
+    if (!authAttemptId) {
+      amrLoginPollCancelledRef.current = true;
+      amrLoginCancelRequestedRef.current = false;
+      setAmrLoginCancelPending(false);
+      setAmrLoginPending(false);
+      return;
+    }
+    const result = await cancelVelaLogin(authAttemptId);
+    if (!result.ok) {
+      setAmrLoginCancelPending(false);
+      setAmrLoginPending(false);
+      setAmrLoginError(t('settings.amrLoginErrorCompact'));
+      return;
+    }
+    if (result.canceled !== true) {
+      const nextStatus = await fetchVelaLoginStatus();
+      if (nextStatus) {
+        setAmrStatus(nextStatus);
+        if (nextStatus.authAttemptId) {
+          amrAuthAttemptIdRef.current = nextStatus.authAttemptId;
+        }
+      }
+      if (loginStartPending && nextStatus?.loginInFlight !== true) {
+        amrLoginCancelRequestedRef.current = true;
+        return;
+      }
+      setAmrLoginCancelPending(false);
+      if (!nextStatus?.loginInFlight) {
+        setAmrLoginPending(false);
+      }
+      return;
+    }
+    setAmrLoginCancelPending(false);
+    amrLoginPollCancelledRef.current = true;
+    if (authAttemptId) {
+      resolveAmrAuthTracking(analytics.track, 'cancelled', undefined, {
+        authAttemptId,
+      });
+    }
+    closeAmrActivationWindowBestEffort();
     setAmrStatus((current) => (
       current
         ? { ...current, loggedIn: false, loginInFlight: false, user: null }
         : current
     ));
     setAmrLoginPending(false);
-    const result = await cancelVelaLogin();
-    closeAmrActivationWindowBestEffort();
-    setAmrLoginCancelPending(false);
-    if (!result.ok) {
-      setAmrLoginError(t('settings.amrLoginErrorCompact'));
-      return;
-    }
     notifyAmrLoginStatusChanged('login-canceled');
   }
 
@@ -1867,20 +2426,35 @@ function OnboardingView({
       if (amrLoginPollCancelledRef.current) return false;
       const nextStatus = await fetchVelaLoginStatus();
       if (nextStatus) setAmrStatus(nextStatus);
+      const authAttemptId = amrAuthAttemptIdRef.current;
+      if (nextStatus && authAttemptId) {
+        observeAmrAuthTracking(analytics.track, nextStatus, authAttemptId);
+      }
       const outcome = amrLoginPollOutcome(nextStatus, startedAt);
       if (outcome === 'signed-in') {
-        resolveAmrAuthTracking(analytics.track, 'success', undefined, {
-          signedInUserId: nextStatus?.user?.id ?? null,
-        });
+        if (authAttemptId) {
+          resolveAmrAuthTracking(analytics.track, 'success', undefined, {
+            authAttemptId,
+            signedInUserId: nextStatus?.user?.id ?? null,
+          });
+        }
         notifyAmrLoginStatusChanged();
         return true;
       }
       if (outcome === 'stopped' || outcome === 'timed-out') {
         if (outcome === 'timed-out') {
-          resolveAmrAuthTracking(analytics.track, 'timeout', 'login_timeout');
-          void cancelVelaLogin();
+          if (authAttemptId) {
+            resolveAmrAuthTracking(analytics.track, 'timeout', 'login_timeout', {
+              authAttemptId,
+            });
+            void cancelVelaLogin(authAttemptId);
+          }
         } else {
-          resolveAmrAuthTracking(analytics.track, 'failed', 'login_stopped');
+          if (authAttemptId) {
+            resolveAmrAuthTracking(analytics.track, 'failed', 'login_stopped', {
+              authAttemptId,
+            });
+          }
         }
         setAmrLoginError(t('settings.amrLoginErrorCompact'));
         return false;
@@ -1907,21 +2481,24 @@ function OnboardingView({
     if (!onboardingSessionId) return;
     aboutYouReportedRef.current = true;
     const snapshot = profileRef.current;
-    // Persist the survey so later AMR entries (outside onboarding) can forward
-    // the visitor's profile to AMR for paid-conversion segmentation.
-    saveOnboardingProfile({
+    const submittedAt = new Date();
+    // The raw "Other" free-text is intentionally excluded from the attribution
+    // profile: it flows into analytics (person properties) and AMR, which must
+    // stay free-text/PII-free. Only the enumerated `source` bucket is carried.
+    // The typed detail is preserved solely in the app-owned Memory note below.
+    const attributionProfile = {
       role: snapshot.role,
       orgSize: snapshot.orgSize,
       useCase: snapshot.useCase,
       source: snapshot.source,
-    });
+      completedAt: submittedAt.toISOString(),
+    };
+    // Persist the survey so later AMR entries (outside onboarding) can forward
+    // the visitor's profile to AMR for paid-conversion segmentation.
+    saveOnboardingProfile(attributionProfile, submittedAt);
+    setOnboardingAttributionPersonProperties(attributionProfile, submittedAt);
     syncAmrAttributionWithOnboardingProfile(
-      {
-        role: snapshot.role,
-        orgSize: snapshot.orgSize,
-        useCase: snapshot.useCase,
-        source: snapshot.source,
-      },
+      attributionProfile,
       {
         metricsConsent: config.telemetry?.metrics === true,
         odDeviceId: amrHandoffDeviceId({
@@ -2069,13 +2646,44 @@ function OnboardingView({
     }
   }
 
+  async function testAgentInline() {
+    if (!selectedAgent || !canTestAgent || agentTestState.status === 'running') return;
+    const inputKey = agentTestInputKey;
+    const agent = selectedAgent;
+    const model = selectedAgentTestModel;
+    const reasoning = selectedAgentTestReasoning;
+    setAgentTestState({ status: 'running', inputKey });
+    try {
+      const result = await testAgent({
+        agentId: agent.id,
+        model: model || undefined,
+        reasoning: reasoning || undefined,
+        agentCliEnv: config.agentCliEnv ?? {},
+      });
+      setAgentTestState({ status: 'done', inputKey, result });
+    } catch (error) {
+      setAgentTestState({
+        status: 'done',
+        inputKey,
+        result: {
+          ok: false,
+          kind: 'unknown',
+          latencyMs: 0,
+          model: model || 'default',
+          agentName: agent.name,
+          detail: error instanceof Error ? error.message : 'Test request failed',
+        },
+      });
+    }
+  }
+
   async function fetchProviderModelsInline() {
     if (!canFetchProviderModels || providerModelsState.status === 'running') return;
     const inputKey = providerModelsInputKey;
     providerModelsAutoFetchKeyRef.current = inputKey;
     const cachedModels = activeProviderModelsCache[inputKey];
     if (cachedModels) {
-      selectFirstProviderModelWhenEmpty(cachedModels, inputKey);
+      selectPreferredProviderModelWhenEmpty(cachedModels, inputKey);
       setProviderModelsState({
         status: 'done',
         inputKey,
@@ -2096,7 +2704,7 @@ function OnboardingView({
         apiKey: config.apiKey,
       });
       if (result.ok && result.models?.length) {
-        selectFirstProviderModelWhenEmpty(result.models, inputKey);
+        selectPreferredProviderModelWhenEmpty(result.models, inputKey);
         activeSetProviderModelsCache((current) => ({
           ...current,
           [inputKey]: result.models ?? [],
@@ -2151,8 +2759,10 @@ function OnboardingView({
     step,
   ]);
 
-  const onboardingNavigationLocked = newsletterSubmitting;
-  const primaryActionLabel = isLastStep && newsletterSubmitting
+  const onboardingNavigationLocked = newsletterSubmitting || byokPersistPending;
+  const primaryActionLabel = byokPersistPending
+    ? t('common.loading')
+    : isLastStep && newsletterSubmitting
     ? t('common.loading')
     : step === 0 && amrLoginPending
     ? t('settings.amrSigningIn')
@@ -2167,11 +2777,6 @@ function OnboardingView({
   // link into the full runtime chooser, and a top-left language/theme bar.
   if (step === 0 && connectExpanded === null) {
     const activeTheme: AppTheme = config.theme ?? 'system';
-    // Resolve what the user is actually *seeing* right now: an explicit dark,
-    // or system that currently maps to the OS's dark preference. The toggle
-    // then flips straight to the opposite explicit theme, so every click
-    // produces a visible change — no dead first click on `system → light`
-    // (both light) before `light → dark` finally darkens on the second.
     const resolvedDark =
       activeTheme === 'dark' ||
       (activeTheme === 'system' &&
@@ -2180,8 +2785,6 @@ function OnboardingView({
         window.matchMedia('(prefers-color-scheme: dark)').matches);
     const themeIcon: 'sun' | 'moon' = resolvedDark ? 'moon' : 'sun';
     const cloudBusy = amrLoginPending;
-    // 登录态尚未拉到时显示「加载中…」并禁用，避免先闪一下「登录」再翻成「继续（已登录）」。
-    // 现在状态在挂载时就并行拉取，所以这个窗口很短。
     const amrStatusResolving = !amrStatusResolved;
     return (
       <section
@@ -2189,7 +2792,7 @@ function OnboardingView({
         aria-label={t('settings.welcomeTitle')}
       >
         <div className="onboarding-cloud__topbar">
-          <LanguageMenu compact />
+          <LanguageMenu compact placement="down" align="end" />
           <button
             type="button"
             className="onboarding-cloud__theme"
@@ -2202,7 +2805,7 @@ function OnboardingView({
         </div>
         <div className="onboarding-cloud__center">
           <span
-            className="onboarding-cloud__logo"
+            className="onboarding-cloud__logo od-brand-glyph"
             role="img"
             aria-label="Open Design"
           />
@@ -2214,16 +2817,9 @@ function OnboardingView({
             onClick={() => {
               if (amrStatusResolving) return;
               if (amrSignedIn) {
-                // 已登录：不再触发登录，但仍记一次 AMR 归因，否则
-                // “已登录直接继续”的用户在 AMR 归因漏斗里会整段隐形
-                // （登录流程的用户由 handleCloudSignIn 记录）。
                 recordAmrEntry(analytics.track, 'onboarding_amr_card', new Date(), {
                   metricsConsent: config.telemetry?.metrics === true,
                 });
-                // Pin the runtime explicitly (mirroring handleCloudSignIn)
-                // rather than leaning on the amrAgent effect, so the
-                // completion event records runtime_type='amr_cloud' even if
-                // amrAgent hasn't resolved yet when Continue is clicked.
                 setRuntime('amr');
                 onModeChange('daemon');
                 onAgentChange('amr');
@@ -2352,7 +2948,7 @@ function OnboardingView({
                     daemonLive={daemonLive}
                     selectedAgentId={config.agentId}
                     selectedAgent={selectedAgent}
-                    selectedModel={selectedAgentChoice.model ?? selectedAgent?.models?.[0]?.id ?? ''}
+                    selectedModel={normalizedSelectedAgentChoice.model ?? defaultAgentModelId(selectedAgent) ?? ''}
                     modelOptions={agentModelOptions}
                     scanStatus={cliScanStatus}
                     onRefresh={() => void scanCliAgents()}
@@ -2362,8 +2958,14 @@ function OnboardingView({
                     }}
                     onSelectModel={(model) => {
                       if (!selectedAgent) return;
-                      onAgentModelChange(selectedAgent.id, { model });
+                      onAgentModelChange(selectedAgent.id, {
+                        model,
+                        serviceTier: undefined,
+                      });
                     }}
+                    testState={visibleAgentTestState}
+                    canTest={canTestAgent}
+                    onTest={() => void testAgentInline()}
                   />
                 ) : null}
                 {connectExpanded === 'byok' ? (
@@ -2385,7 +2987,7 @@ function OnboardingView({
                       );
                       updateApiConfig({
                         baseUrl: provider?.baseUrl ?? '',
-                        model: provider?.model ?? '',
+                        model: defaultKnownProviderModel(provider),
                         apiProviderBaseUrl: provider?.baseUrl ?? null,
                       });
                     }}
@@ -2395,7 +2997,10 @@ function OnboardingView({
                       updateApiConfig({ model });
                     }}
                     onBaseUrlChange={(baseUrl) =>
-                      updateApiConfig({ baseUrl, apiProviderBaseUrl: null })
+                      updateApiConfig({
+                        baseUrl,
+                        apiProviderBaseUrl: apiProtocol === 'azure' ? '' : null,
+                      })
                     }
                     modelOptions={byokModelOptions}
                     testState={visibleProviderTestState}
@@ -2436,7 +3041,7 @@ function OnboardingView({
                         role: value,
                       });
                     }
-                    setProfile((current) => ({ ...current, role: value }));
+                    updateProfile((current) => ({ ...current, role: value }));
                   }}
                 />
                 <OnboardingChipField
@@ -2449,7 +3054,7 @@ function OnboardingView({
                         organization_size: value,
                       });
                     }
-                    setProfile((current) => ({ ...current, orgSize: value }));
+                    updateProfile((current) => ({ ...current, orgSize: value }));
                   }}
                 />
                 <OnboardingChipField
@@ -2474,7 +3079,7 @@ function OnboardingView({
                         emitOnboardingClick('use_case', 'select_option', { use_case: v });
                       }
                     }
-                    setProfile((current) => ({ ...current, useCase: value }));
+                    updateProfile((current) => ({ ...current, useCase: value }));
                   }}
                 />
                 <OnboardingChipField
@@ -2487,8 +3092,39 @@ function OnboardingView({
                         discovery_source: value,
                       });
                     }
-                    setProfile((current) => ({ ...current, source: value }));
+                    // Clear the free-text detail whenever the chip changes away
+                    // from 'Other' so a stale custom value never leaks into
+                    // attribution for a different bucket. Routed through
+                    // updateProfile so the live ref reflects the cleared value
+                    // immediately, even if the user changes chip then continues.
+                    updateProfile((current) => ({
+                      ...current,
+                      source: typeof value === 'string' ? value : current.source,
+                      sourceOther: value === 'other' ? current.sourceOther : '',
+                    }));
                   }}
+                  trailing={
+                    profile.source === 'other' ? (
+                      <input
+                        type="text"
+                        className="onboarding-chip-field__other-input"
+                        maxLength={64}
+                        autoComplete="off"
+                        autoFocus
+                        placeholder={t('settings.onboardingSourceOtherPlaceholder')}
+                        aria-label={t('settings.onboardingSourceOtherPlaceholder')}
+                        value={profile.sourceOther}
+                        onChange={(event) => {
+                          const next = event.target.value;
+                          // updateProfile keeps profileRef in sync synchronously
+                          // so the Memory note (written from the live ref) never
+                          // drops the latest keystrokes on a fast type-then-
+                          // Continue.
+                          updateProfile((current) => ({ ...current, sourceOther: next }));
+                        }}
+                      />
+                    ) : null
+                  }
                 />
               </div>
             </div>
@@ -2521,7 +3157,7 @@ function OnboardingView({
                   placeholder={t('newsletter.placeholder')}
                   value={profile.email}
                   onChange={(event) =>
-                    setProfile((current) => ({ ...current, email: event.target.value }))
+                    updateProfile((current) => ({ ...current, email: event.target.value }))
                   }
                 />
               </label>
@@ -2529,124 +3165,103 @@ function OnboardingView({
           ) : null}
 
           {step === 3 ? (
-            <div className="onboarding-view__panel onboarding-view__panel--newsletter">
-              <button
-                type="button"
-                className="onboarding-view__back-to-cloud"
-                onClick={handleBackWithTracking}
-                disabled={onboardingNavigationLocked}
-              >
-                <Icon name="chevron-left" size={14} />
-                <span>{t('settings.onboardingBack')}</span>
-              </button>
-              <OnboardingPanelHeader
-                title={t('onboarding.brandTitle')}
-                body={t('onboarding.brandSubtitle')}
-              />
-              <label className="onboarding-view__email-field">
-                <span className="onboarding-view__email-label">
-                  {t('newBrand.urlLabel')}
-                </span>
-                <input
-                  className="onboarding-view__brand-url-input"
-                  type="url"
-                  autoComplete="url"
-                  inputMode="url"
-                  placeholder={t('newBrand.urlPlaceholder')}
-                  value={brandUrl}
-                  disabled={brandExtractActive}
-                  onChange={(event) => setBrandUrl(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (
-                      event.key === 'Enter' &&
-                      brandUrl.trim() &&
-                      !brandExtractActive
-                    ) {
-                      event.preventDefault();
-                      void handleOnboardingBrandExtract();
-                    }
-                  }}
-                />
-              </label>
-              <div className="onboarding-view__brand-action-row">
-                <div className="onboarding-view__brand-action-statuses">
-                  {brandExtractActive ? (
-                    <span
-                      className="onboarding-view__action-status"
-                      role="status"
-                    >
-                      {t('brand.extracting')}
-                    </span>
-                  ) : null}
-                  {brandExtractDone ? (
-                    <span className="onboarding-view__action-status" role="status">
-                      {t('onboarding.brandDone')}
-                    </span>
-                  ) : null}
-                  {brandExtractFailed ? (
-                    <span
-                      className="onboarding-view__action-status is-error"
-                      role="alert"
-                    >
-                      {brandExtractState.error || t('brand.failed')}
-                    </span>
-                  ) : null}
+            <div className="onboarding-view__panel onboarding-view__build">
+              <span className="onboarding-view__build-badge">
+                <Icon name="sparkles" size={13} aria-hidden />
+                <span>{t('settings.onboardingDesignTitle')}</span>
+              </span>
+              <div className="onboarding-view__build-layout">
+                <div className="onboarding-view__build-copy">
+                  <div className="onboarding-view__build-head">
+                    <h2>{t('onboarding.buildTitle')}</h2>
+                    <p>{t('onboarding.buildBody')}</p>
+                  </div>
+                  <div className="onboarding-view__build-benefits">
+                    <div>
+                      <Icon name="file-text" size={15} aria-hidden />
+                      <strong>{t('onboarding.buildBenefitMemoryTitle')}</strong>
+                      <span>{t('onboarding.buildBenefitMemoryBody')}</span>
+                    </div>
+                    <div>
+                      <Icon name="swatchbook" size={15} aria-hidden />
+                      <strong>{t('onboarding.buildBenefitAlignedTitle')}</strong>
+                      <span>{t('onboarding.buildBenefitAlignedBody')}</span>
+                    </div>
+                    <div>
+                      <Icon name="github" size={15} aria-hidden />
+                      <strong>{t('onboarding.buildBenefitSourcesTitle')}</strong>
+                      <span>{t('onboarding.buildBenefitSourcesBody')}</span>
+                    </div>
+                  </div>
                 </div>
-                <div className="onboarding-view__brand-action-group">
-                  <button
-                    type="button"
-                    className="onboarding-view__secondary"
-                    onClick={handlePrimaryAction}
-                    disabled={newsletterSubmitting}
-                    aria-busy={newsletterSubmitting ? true : undefined}
-                  >
-                    <span>{t('onboarding.brandSkip')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={`onboarding-view__secondary${brandExtractActive ? ' is-loading' : ''}`}
-                    onClick={() => {
-                      void handleOnboardingBrandExtract();
-                    }}
-                    disabled={!brandUrl.trim() || brandExtractActive}
-                  >
-                    {brandExtractActive
-                      ? t('brand.extracting')
-                      : t('newBrand.extract')}
-                  </button>
+                <div className="onboarding-view__build-preview" aria-hidden>
+                  <div className="onboarding-view__build-preview-head">
+                    <span />
+                    <span />
+                    <span />
+                    <strong>DESIGN.md</strong>
+                  </div>
+                  <div className="onboarding-view__build-preview-body">
+                    <small>{t('onboarding.buildPreviewLabel')}</small>
+                    <div className="onboarding-view__build-preview-swatches">
+                      <i />
+                      <i />
+                      <i />
+                      <i />
+                    </div>
+                    <div className="onboarding-view__build-preview-type">
+                      <strong>Aa</strong>
+                      <span>Aa</span>
+                      <em>Aa</em>
+                    </div>
+                    <div className="onboarding-view__build-preview-lines">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </div>
                 </div>
+              </div>
+              <ul className="onboarding-view__build-chips">
+                {ONBOARDING_ARTIFACT_CHIP_IDS.map((chipId) => (
+                  <li key={chipId}>{homeHeroChipLabel(chipId, t)}</li>
+                ))}
+              </ul>
+              <div className="onboarding-view__build-actions">
                 <button
                   type="button"
-                  className="onboarding-view__secondary onboarding-view__brand-finish"
-                  onClick={handlePrimaryAction}
+                  className="onboarding-view__ghost onboarding-view__build-back"
+                  onClick={handleBackWithTracking}
+                  disabled={onboardingNavigationLocked}
+                >
+                  {t('settings.onboardingBack')}
+                </button>
+                <button
+                  type="button"
+                  className="onboarding-view__secondary"
+                  onClick={() => {
+                    void handleFinishToHome();
+                  }}
+                  disabled={newsletterSubmitting}
+                >
+                  {t('onboarding.buildHome')}
+                </button>
+                <button
+                  type="button"
+                  className="onboarding-view__primary"
+                  onClick={() => {
+                    void handleFinishToBuild();
+                  }}
                   disabled={newsletterSubmitting}
                   aria-busy={newsletterSubmitting ? true : undefined}
                 >
-                  <span>{t('settings.onboardingFinish')}</span>
+                  <span>{t('onboarding.buildStart')}</span>
                 </button>
-              </div>
-              <div
-                style={{
-                  marginTop: 22,
-                  paddingTop: 18,
-                  borderTop: '1px solid var(--border)',
-                }}
-              >
-                <BrandReferencePicker
-                  variant="compact"
-                  busy={brandExtractActive}
-                  error={
-                    brandExtractFailed
-                      ? brandExtractState.error || t('brand.failed')
-                      : null
-                  }
-                  onPick={handleOnboardingPickReference}
-                />
               </div>
             </div>
           ) : null}
 
-          {!isLastStep ? (
+          {step === 3 ? null : (
             <div className="onboarding-view__actions">
               {step === 0 && amrLoginError ? (
                 <span className="onboarding-view__action-status is-error" role="alert">
@@ -2669,11 +3284,7 @@ function OnboardingView({
                   connectGateTooltip ? ' od-tooltip' : ''
                 }`}
                 onClick={handlePrimaryAction}
-                // The Connect gate uses `aria-disabled`, not the native `disabled`
-                // attribute, so the button still receives hover/focus and can show
-                // its tooltip explaining what to configure. `handlePrimaryAction`
-                // guards the click. Truly-busy states stay natively disabled.
-                disabled={amrLoginPending || amrLoginCancelPending || newsletterSubmitting}
+                disabled={amrLoginPending || amrLoginCancelPending || onboardingNavigationLocked}
                 aria-disabled={connectStepBlocked || undefined}
                 data-tooltip={connectGateTooltip ?? undefined}
                 data-tooltip-placement="top"
@@ -2682,7 +3293,7 @@ function OnboardingView({
                 <span>{primaryActionLabel}</span>
               </button>
             </div>
-          ) : null}
+          )}
         </div>
       </div>
     </section>
@@ -2700,6 +3311,9 @@ function OnboardingCliSetupPanel({
   onRefresh,
   onSelectAgent,
   onSelectModel,
+  testState,
+  canTest,
+  onTest,
 }: {
   agents: AgentInfo[];
   daemonLive: boolean;
@@ -2711,9 +3325,13 @@ function OnboardingCliSetupPanel({
   onRefresh: () => void;
   onSelectAgent: (agentId: string) => void;
   onSelectModel: (model: string) => void;
+  testState: OnboardingAgentTestState;
+  canTest: boolean;
+  onTest: () => void;
 }) {
   const t = useT();
   const scanning = scanStatus === 'scanning';
+  const running = testState.status === 'running';
   const showEmpty = scanStatus === 'done' && agents.length === 0;
   return (
     <div className="onboarding-view__setup-panel">
@@ -2722,14 +3340,25 @@ function OnboardingCliSetupPanel({
           <strong>{t('settings.localCli')}</strong>
           <p>{daemonLive ? t('settings.codeAgentHint') : t('settings.modeDaemonOffline')}</p>
         </div>
-        <button
-          type="button"
-          className={`onboarding-view__mini-button${scanning ? ' is-loading' : ''}`}
-          onClick={onRefresh}
-          disabled={scanning}
-        >
-          {scanning ? t('settings.rescanRunning') : t('settings.rescan')}
-        </button>
+        <div className="onboarding-view__setup-head-actions">
+          <button
+            type="button"
+            className={`onboarding-view__mini-button${scanning ? ' is-loading' : ''}`}
+            onClick={onRefresh}
+            disabled={scanning}
+          >
+            {scanning ? t('settings.rescanRunning') : t('settings.rescan')}
+          </button>
+          <button
+            type="button"
+            className={`onboarding-view__mini-button${running ? ' is-loading' : ''}`}
+            onClick={onTest}
+            disabled={running || !canTest}
+            title={t('settings.testTitle')}
+          >
+            {running ? t('settings.testRunning') : t('settings.test')}
+          </button>
+        </div>
       </div>
       {scanning ? (
         <div className="onboarding-view__scan-copy" role="status">
@@ -2780,8 +3409,125 @@ function OnboardingCliSetupPanel({
           searchPlaceholder={t('newproj.modelSearch')}
         />
       ) : null}
+      {testState.status === 'running' ? (
+        <p className="onboarding-view__test-status is-running" role="status">
+          {t('settings.testRunning')}
+        </p>
+      ) : testState.status === 'done' ? (
+        <p
+          className={`onboarding-view__test-status is-${onboardingTestVariant(
+            testState.result,
+          )}`}
+          role={testState.result.ok ? 'status' : 'alert'}
+        >
+          {renderOnboardingAgentTestMessage(
+            t,
+            testState.result,
+            selectedAgent?.name ?? '',
+          )}
+        </p>
+      ) : null}
     </div>
   );
+}
+
+function OnboardingAmrModelSelect({
+  models,
+  modelsSource,
+  selectedModel,
+  onSelectModel,
+}: {
+  models: NonNullable<AgentInfo['models']>;
+  modelsSource: AgentInfo['modelsSource'];
+  selectedModel: string;
+  onSelectModel: (model: string) => void;
+}) {
+  const t = useT();
+  const modelSource = modelsSource ?? 'fallback';
+  const displayModels = models.map((model) => {
+    const capability = onboardingModelCapabilityLabel(t, model);
+    const cost = onboardingModelCostLabel(t, model);
+    return {
+      value: model.id,
+      label: formatOnboardingAmrModelLabel(model),
+      tag: capability?.label,
+      tagKind: capability?.kind,
+      meta: cost?.label,
+    };
+  });
+  const modelSourceLabel = t('settings.onboardingAmrModelSourceLabel');
+  return (
+    <div
+      className="onboarding-view__model-picker"
+      onClick={(event) => event.stopPropagation()}
+    >
+      <OnboardingDropdown
+        label={`${t('settings.modelPicker')} · ${modelSourceLabel}`}
+        placeholder={t('settings.modelSourceFallback')}
+        value={selectedModel}
+        options={displayModels}
+        onChange={onSelectModel}
+        searchable
+        searchPlaceholder={t('newproj.modelSearch')}
+        sourceTone={modelSource}
+      />
+    </div>
+  );
+}
+
+function formatOnboardingAmrModelLabel(
+  model: NonNullable<AgentInfo['models']>[number],
+): string {
+  const label = model.label?.trim();
+  if (label && label !== model.id && !/^[a-z0-9._-]+$/.test(label)) {
+    return label;
+  }
+  return model.id
+    .split('-')
+    .filter(Boolean)
+    .map(formatModelToken)
+    .join(' ');
+}
+
+function formatModelToken(token: string): string {
+  const lower = token.toLowerCase();
+  const known: Record<string, string> = {
+    claude: 'Claude',
+    opus: 'Opus',
+    sonnet: 'Sonnet',
+    haiku: 'Haiku',
+    deepseek: 'DeepSeek',
+    gemini: 'Gemini',
+    glm: 'GLM',
+    gpt: 'GPT',
+    oss: 'OSS',
+    kimi: 'Kimi',
+    minimax: 'MiniMax',
+    mimo: 'MiMo',
+    qwen3: 'Qwen3',
+    seed: 'Seed',
+  };
+  if (known[lower]) return known[lower];
+  if (/^v\d/i.test(token)) return token.toUpperCase();
+  if (/^\d+b$/i.test(token) || /^a\d+b$/i.test(token)) return token.toUpperCase();
+  if (/^\d+(\.\d+)*$/.test(token)) return token;
+  return token.charAt(0).toUpperCase() + token.slice(1);
+}
+
+function onboardingModelCapabilityLabel(
+  t: ReturnType<typeof useT>,
+  model: Pick<NonNullable<AgentInfo['models']>[number], 'id' | 'metadata'>,
+): { label: string; kind: ModelCapabilityTag } | undefined {
+  const tag = getModelCapabilityTag(model);
+  return tag ? { label: t(MODEL_CAPABILITY_TAG_LABEL_KEYS[tag]), kind: tag } : undefined;
+}
+
+function onboardingModelCostLabel(
+  t: ReturnType<typeof useT>,
+  model: Pick<NonNullable<AgentInfo['models']>[number], 'id' | 'metadata'>,
+): { label: string } | undefined {
+  const tier = getModelCostTier(model);
+  return tier ? { label: t(MODEL_COST_TIER_LABEL_KEYS[tier]) } : undefined;
 }
 
 function OnboardingByokSetupPanel({
@@ -2836,6 +3582,7 @@ function OnboardingByokSetupPanel({
   const t = useT();
   const running = testState.status === 'running';
   const fetchingModels = modelsState.status === 'running';
+  const useDeploymentInput = apiProtocol === 'azure';
   return (
     <div className="onboarding-view__setup-panel">
       <div className="onboarding-view__setup-head">
@@ -2888,6 +3635,7 @@ function OnboardingByokSetupPanel({
         value={selectedProvider?.baseUrl ?? ''}
         options={providerOptions}
         onChange={onProviderChange}
+        allowEmptyValue={apiProtocol === 'azure'}
         searchable
         searchPlaceholder={t('settings.quickFillProvider')}
       />
@@ -2916,10 +3664,10 @@ function OnboardingByokSetupPanel({
             onChange={(event) => onBaseUrlChange(event.target.value)}
           />
         </label>
-        {modelOptions.length > 0 ? (
+        {modelOptions.length > 0 && !useDeploymentInput ? (
           <OnboardingDropdown
             label={t('settings.model')}
-            placeholder={selectedProvider?.model ?? 'claude-sonnet-4-5'}
+            placeholder={defaultKnownProviderModel(selectedProvider) || 'claude-sonnet-4-5'}
             value={model}
             options={modelOptions}
             onChange={onModelChange}
@@ -2929,11 +3677,19 @@ function OnboardingByokSetupPanel({
           />
         ) : (
           <label className="onboarding-view__inline-field">
-            <span>{t('settings.model')}</span>
+            <span>
+              {useDeploymentInput
+                ? t('settings.azureDeploymentModel')
+                : t('settings.model')}
+            </span>
             <input
               type="text"
               value={model}
-              placeholder={selectedProvider?.model ?? 'claude-sonnet-4-5'}
+              placeholder={
+                useDeploymentInput
+                  ? t('settings.azureDeploymentModel')
+                  : defaultKnownProviderModel(selectedProvider) || 'claude-sonnet-4-5'
+              }
               onChange={(event) => onModelChange(event.target.value.trim())}
             />
           </label>
@@ -3046,8 +3802,43 @@ function renderOnboardingProviderTestMessage(
       return t('settings.testInvalidBaseUrl');
     case 'rate_limited':
       return t('settings.testRateLimited');
-    case 'upstream_unavailable':
-      return t('settings.testUpstream', { status: result.status ?? 0 });
+    case 'upstream_unavailable': {
+      const baseMessage = t('settings.testUpstream', {
+        status: result.status ?? 0,
+      });
+      return result.detail ? `${baseMessage} ${result.detail}` : baseMessage;
+    }
+    case 'timeout':
+      return t('settings.testTimeout', { ms });
+    default:
+      return t('settings.testUnknown', { detail: result.detail ?? '' });
+  }
+}
+
+function renderOnboardingAgentTestMessage(
+  t: ReturnType<typeof useT>,
+  result: ConnectionTestResponse,
+  fallbackAgentName: string,
+): string {
+  const ms = Math.max(0, Math.round(result.latencyMs));
+  const sample = result.sample ?? '';
+  const agentName = result.agentName ?? fallbackAgentName;
+  if (result.ok) {
+    const baseMessage = t('settings.testSuccessCli', { agentName, ms, sample });
+    return result.detail ? `${baseMessage} ${result.detail}` : baseMessage;
+  }
+  switch (result.kind) {
+    case 'agent_not_installed':
+      return t('settings.testAgentMissing', { agentName });
+    case 'agent_auth_required':
+      return result.detail || 'Agent authentication is required.';
+    case 'agent_spawn_failed':
+      return t('settings.testAgentSpawn', {
+        agentName,
+        detail: result.detail ?? '',
+      });
+    case 'rate_limited':
+      return t('settings.testRateLimited');
     case 'timeout':
       return t('settings.testTimeout', { ms });
     default:
@@ -3073,8 +3864,12 @@ function renderOnboardingProviderModelsMessage(
       return t('settings.testInvalidBaseUrl');
     case 'rate_limited':
       return t('settings.testRateLimited');
-    case 'upstream_unavailable':
-      return t('settings.testUpstream', { status: result.status ?? 0 });
+    case 'upstream_unavailable': {
+      const baseMessage = t('settings.testUpstream', {
+        status: result.status ?? 0,
+      });
+      return result.detail ? `${baseMessage} ${result.detail}` : baseMessage;
+    }
     case 'timeout':
       return t('settings.testTimeout', {
         ms: Math.max(0, Math.round(result.latencyMs)),
@@ -3097,7 +3892,7 @@ function OnboardingPanelHeader({ title, body }: { title: string; body: string })
   );
 }
 
-type OnboardingChipFieldProps =
+type OnboardingChipFieldProps = (
   | {
       label: string;
       options: Array<{ value: string; label: string }>;
@@ -3111,19 +3906,24 @@ type OnboardingChipFieldProps =
       value: string[];
       onChange: (value: string[]) => void;
       multiple: true;
-    };
+    }
+) & {
+  // Optional element rendered inline at the end of the chip row (e.g. a
+  // free-text input revealed by an "Other" pick), so it reads as attached
+  // to the last chip rather than floating below the group.
+  trailing?: ReactNode;
+};
 
-// Profile fields render their options as a flat row of toggleable chips
-// instead of a dropdown, so a pick is one tap with every choice already in
-// view. Single-select chips behave as a radio (re-tapping clears); multi
-// select chips toggle independently.
+// Profile fields render their options as flat toggleable chips so every choice
+// is visible and a selection takes one tap instead of opening a dropdown first.
 function OnboardingChipField(props: OnboardingChipFieldProps) {
-  const { label, options } = props;
-  const selected: string[] = props.multiple
+  const { label, options, trailing } = props;
+  const selected = props.multiple
     ? props.value
     : props.value
       ? [props.value]
       : [];
+
   return (
     <div className="onboarding-chip-field">
       <span className="onboarding-chip-field__label">{label}</span>
@@ -3152,19 +3952,29 @@ function OnboardingChipField(props: OnboardingChipFieldProps) {
             </button>
           );
         })}
+        {trailing}
       </div>
     </div>
   );
 }
 
+type OnboardingDropdownOption = {
+  value: string;
+  label: string;
+  tag?: string;
+  tagKind?: ModelCapabilityTag;
+  meta?: string;
+};
+
 type OnboardingDropdownBaseProps = {
   label: string;
   placeholder: string;
-  options: Array<{ value: string; label: string }>;
+  options: OnboardingDropdownOption[];
   placement?: 'bottom' | 'top';
   searchable?: boolean;
   searchPlaceholder?: string;
   sourceTone?: string;
+  allowEmptyValue?: boolean;
 };
 
 type OnboardingDropdownProps =
@@ -3191,6 +4001,7 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
     searchable = false,
     searchPlaceholder,
     sourceTone,
+    allowEmptyValue = false,
   } = props;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -3198,13 +4009,22 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
   const [menuMaxHeight, setMenuMaxHeight] = useState(240);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const dropdownIdRef = useRef(`onboarding-dropdown-${Math.random().toString(36).slice(2)}`);
-  const selectedValues = Array.isArray(value) ? value : value ? [value] : [];
+  const selectedValues = Array.isArray(value)
+    ? value
+    : value || allowEmptyValue
+      ? [value]
+      : [];
   const selectedOptions = options.filter((option) => selectedValues.includes(option.value));
   const selectedOption = selectedOptions[0];
   const hasValue = selectedOptions.length > 0;
   const selectedLabel = multiple
     ? selectedOptions.map((option) => option.label).join(', ')
     : selectedOption?.label;
+  const selectedTag = multiple ? undefined : selectedOption?.tag;
+  const selectedTagKind = multiple ? undefined : selectedOption?.tagKind;
+  const selectedTagDescriptionId = selectedTag
+    ? `${dropdownIdRef.current}-selected-tag`
+    : undefined;
   const triggerLabel = selectedLabel || placeholder;
   const normalizedQuery = query.trim().toLowerCase();
   const visibleOptions =
@@ -3320,10 +4140,23 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
         }`}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={triggerLabel}
+        aria-describedby={selectedTagDescriptionId}
         title={triggerLabel}
         onClick={toggleOpen}
       >
-        <span>{triggerLabel}</span>
+        <span className="onboarding-view__select-trigger-value">
+          <span>{triggerLabel}</span>
+          {selectedTag ? (
+            <span
+              className="onboarding-view__select-badge"
+              data-tag={selectedTagKind}
+              id={selectedTagDescriptionId}
+            >
+              {selectedTag}
+            </span>
+          ) : null}
+        </span>
         <Icon name="chevron-down" size={16} />
       </button>
       {open ? (
@@ -3359,8 +4192,15 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
             aria-label={label}
             aria-multiselectable={multiple || undefined}
           >
-            {visibleOptions.map((option) => {
+            {visibleOptions.map((option, index) => {
               const selected = selectedValues.includes(option.value);
+              const optionId = `${dropdownIdRef.current}-option-${index}`;
+              const optionLabelId = `${optionId}-label`;
+              const optionMetaId = option.meta ? `${optionId}-meta` : undefined;
+              const optionTagId = option.tag ? `${optionId}-tag` : undefined;
+              const optionDescriptionIds = [optionMetaId, optionTagId]
+                .filter(Boolean)
+                .join(' ') || undefined;
               return (
                 <button
                   key={option.value}
@@ -3368,6 +4208,8 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
                   className={`onboarding-view__select-option${selected ? ' is-selected' : ''}`}
                   role="option"
                   aria-selected={selected}
+                  aria-labelledby={optionLabelId}
+                  aria-describedby={optionDescriptionIds}
                   onClick={() => {
                     if (props.multiple) {
                       props.onChange(
@@ -3381,7 +4223,28 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
                     setOpen(false);
                   }}
                 >
-                  <span>{option.label}</span>
+                  <span className="onboarding-view__select-option-content">
+                    <span className="onboarding-view__select-option-copy">
+                      <span id={optionLabelId}>{option.label}</span>
+                      {option.meta ? (
+                        <span
+                          className="onboarding-view__select-option-meta"
+                          id={optionMetaId}
+                        >
+                          {option.meta}
+                        </span>
+                      ) : null}
+                    </span>
+                    {option.tag ? (
+                      <span
+                        className="onboarding-view__select-badge"
+                        data-tag={option.tagKind}
+                        id={optionTagId}
+                      >
+                        {option.tag}
+                      </span>
+                    ) : null}
+                  </span>
                   {selected ? <Icon name="check" size={15} /> : null}
                 </button>
               );
@@ -3403,3 +4266,201 @@ export function OnboardingDropdown(props: OnboardingDropdownProps) {
 // The AMR brand (icon + name) is known up-front and rendered solid; only the
 // version meta, benefit list, and model picker — the parts that depend on the
 // probe result — shimmer. Non-interactive and announced via role="status".
+function OnboardingAmrCloudSkeleton() {
+  const t = useT();
+  return (
+    <div className="onboarding-view__amr-cloud-card">
+      <div
+        className="onboarding-view__card onboarding-view__card--featured onboarding-view__card--amr onboarding-view__card--benefit-aside onboarding-view__card--skeleton"
+        role="status"
+        aria-busy="true"
+        aria-label={t('common.loading')}
+      >
+        <span className="onboarding-view__identity">
+          <span className="onboarding-view__icon onboarding-view__icon--asset">
+            <AgentIcon id="amr" size={52} className="onboarding-view__agent-logo" />
+          </span>
+          <span className="onboarding-view__card-copy">
+            <span className="onboarding-view__card-top">
+              <strong>{t('settings.amrCloud')}</strong>
+            </span>
+            <span className="onboarding-view__skeleton-line onboarding-view__skeleton-line--meta" />
+          </span>
+        </span>
+        <span className="onboarding-view__benefit-aside" aria-hidden="true">
+          <span className="onboarding-view__benefit-stack onboarding-view__benefit-stack--skeleton">
+            <span className="onboarding-view__skeleton-line onboarding-view__skeleton-line--benefit" />
+            <span className="onboarding-view__skeleton-line onboarding-view__skeleton-line--benefit" />
+            <span className="onboarding-view__skeleton-line onboarding-view__skeleton-line--benefit" />
+            <span className="onboarding-view__skeleton-line onboarding-view__skeleton-line--benefit" />
+          </span>
+        </span>
+        <span className="onboarding-view__card-model" aria-hidden="true">
+          <span className="onboarding-view__skeleton-model">
+            <span className="onboarding-view__skeleton-model-label" />
+            <span className="onboarding-view__skeleton-model-bar" />
+          </span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function OnboardingChoiceCard({
+  icon,
+  agentIconId,
+  title,
+  body,
+  benefits,
+  upcomingLabel,
+  upcomingBenefits,
+  benefitPlacement = 'copy',
+  metaLabel,
+  modelSlot,
+  actionLabel,
+  selected,
+  badge,
+  statusSlot,
+  featured,
+  variant,
+  onClick,
+}: {
+  icon: 'orbit' | 'hammer' | 'sliders' | 'github' | 'upload' | 'sparkles';
+  agentIconId?: string;
+  title: string;
+  body: string;
+  benefits?: string[];
+  upcomingLabel?: string;
+  upcomingBenefits?: string[];
+  benefitPlacement?: 'copy' | 'aside';
+  metaLabel?: string;
+  modelSlot?: ReactNode;
+  actionLabel?: string;
+  selected: boolean;
+  badge?: string;
+  statusSlot?: ReactNode;
+  featured?: boolean;
+  variant?: 'amr';
+  onClick: () => void;
+}) {
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    onClick();
+  }
+
+  const hasBenefits =
+    (benefits && benefits.length > 0) ||
+    (upcomingBenefits && upcomingBenefits.length > 0);
+  const benefitStack = hasBenefits ? (
+    <span className="onboarding-view__benefit-stack">
+      {benefits && benefits.length > 0 ? (
+        <span className="onboarding-view__benefits">
+          {benefits.map((item, index) => (
+            <span
+              key={item}
+              className={`onboarding-view__benefit${
+                index >= 2 ? ' onboarding-view__benefit--hero' : ''
+              }`}
+            >
+              {item}
+            </span>
+          ))}
+        </span>
+      ) : null}
+      {upcomingBenefits && upcomingBenefits.length > 0 ? (
+        <span className="onboarding-view__upcoming-benefits">
+          {upcomingLabel ? (
+            <span className="onboarding-view__upcoming-label">{upcomingLabel}</span>
+          ) : null}
+          {upcomingBenefits.map((item) => (
+            <span key={item} className="onboarding-view__benefit onboarding-view__benefit--upcoming">
+              {item}
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </span>
+  ) : null;
+  const modelUnderLogo = variant === 'amr' && modelSlot;
+  const iconNode = (
+    <span
+      className={
+        'onboarding-view__icon' +
+        (agentIconId ? ' onboarding-view__icon--asset' : '')
+      }
+    >
+      {agentIconId ? (
+        <AgentIcon
+          id={agentIconId}
+          size={featured ? 52 : 40}
+          className="onboarding-view__agent-logo"
+        />
+      ) : (
+        <Icon name={icon} size={18} />
+      )}
+    </span>
+  );
+  const copyNode = (
+    <span className="onboarding-view__card-copy">
+      <span className="onboarding-view__card-top">
+        <strong>{title}</strong>
+        {badge ? <span className="onboarding-view__badge">{badge}</span> : null}
+      </span>
+      {metaLabel ? <span className="onboarding-view__card-meta">{metaLabel}</span> : null}
+      {modelUnderLogo ? null : modelSlot}
+      {benefitPlacement === 'copy' && benefitStack ? (
+        benefitStack
+      ) : !modelSlot ? (
+        <small>{body}</small>
+      ) : null}
+    </span>
+  );
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={`onboarding-view__card${selected ? ' is-selected' : ''}${
+        featured ? ' onboarding-view__card--featured' : ''
+      }${variant ? ` onboarding-view__card--${variant}` : ''}${
+        benefitPlacement === 'aside' ? ' onboarding-view__card--benefit-aside' : ''
+      }`}
+      onClick={onClick}
+      onKeyDown={handleKeyDown}
+      aria-pressed={selected}
+    >
+      {variant === 'amr' ? (
+        <span className="onboarding-view__identity">
+          {iconNode}
+          {copyNode}
+        </span>
+      ) : (
+        <>
+          {iconNode}
+          {copyNode}
+        </>
+      )}
+      {modelUnderLogo ? (
+        <span className="onboarding-view__card-model">
+          {modelSlot}
+        </span>
+      ) : null}
+      {benefitPlacement === 'aside' && benefitStack ? (
+        <span className="onboarding-view__benefit-aside">{benefitStack}</span>
+      ) : null}
+      {statusSlot ? (
+        <span className="onboarding-view__card-status">
+          {statusSlot}
+        </span>
+      ) : null}
+      {actionLabel ? <span className="onboarding-view__card-action">{actionLabel}</span> : null}
+      {selected ? (
+        <span className="onboarding-view__check">
+          <Icon name="check" size={14} />
+        </span>
+      ) : null}
+    </div>
+  );
+}

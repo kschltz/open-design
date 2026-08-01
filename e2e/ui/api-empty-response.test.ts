@@ -1,5 +1,6 @@
 import { expect, test } from '@/playwright/suite';
-import { ensureRailOpen } from '@/playwright/rail';
+import { fulfillAgentsRoute, routeSuccessfulRuns } from '@/playwright/mock-factory';
+import { openNewProjectModal as openNewProjectModalFromProjects } from '@/playwright/rail';
 import type { Page } from '@playwright/test';
 import { T } from '@/timeouts';
 
@@ -14,9 +15,12 @@ test.beforeEach(async ({ page }) => {
       JSON.stringify({
         mode: 'api',
         apiProtocol: 'openai',
-        apiKey: 'sk-test',
+        apiKey: '',
         baseUrl: 'https://api.deepseek.com',
-        model: 'deepseek-chat',
+        model: 'deepseek-v4-flash',
+        byokProfileId: 'byok-api-empty-response',
+        byokCredentialConfigured: true,
+        byokCredentialTail: 'test',
         agentId: null,
         skillId: null,
         designSystemId: null,
@@ -47,25 +51,49 @@ test.beforeEach(async ({ page }) => {
       },
     });
   });
+  await page.route('**/api/agents**', async (route) => {
+    await fulfillAgentsRoute(route, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: true,
+        version: 'test',
+        models: [{ id: 'default', label: 'Default' }],
+      },
+    ]);
+  });
+  await page.route('**/api/byok/profiles', async (route) => {
+    await route.fulfill({
+      json: {
+        available: true,
+        backend: 'test',
+        profiles: [{
+          id: 'byok-api-empty-response',
+          label: 'DeepSeek',
+          protocol: 'openai',
+          baseUrl: 'https://api.deepseek.com',
+          model: 'deepseek-v4-flash',
+          requiresApiKey: true,
+          configured: true,
+          keyTail: 'test',
+          createdAt: 1,
+          updatedAt: 1,
+        }],
+      },
+    });
+  });
 });
 
 test('[P0] @critical API empty stream shows No output instead of Done', async ({ page }) => {
-  await page.route('**/api/proxy/openai/stream', async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-      },
-      body: ['event: end', 'data: {}', '', ''].join('\n'),
-    });
-  });
+  const runRequests = await routeSuccessfulRuns(page, { runIdPrefix: 'api-empty-response-run' });
 
   await gotoEntryHome(page);
   await createProject(page, 'API empty response smoke');
   await expectWorkspaceReady(page);
   await sendPrompt(page, 'Create a login page');
 
+  await runRequests.expectCount(1);
   await expect(page.locator('.assistant-label', { hasText: 'No output' })).toBeVisible();
   await expect(page.getByText(/provider ended the request/i).first()).toBeVisible();
   await expect(page.locator('.assistant-label', { hasText: 'Done' })).toHaveCount(0);
@@ -91,15 +119,12 @@ async function gotoEntryHome(page: Page) {
 }
 
 async function openNewProjectModal(page: Page) {
-  await ensureRailOpen(page);
-  await page.getByTestId('entry-nav-new-project').click();
-  await expect(page.getByTestId('new-project-modal')).toBeVisible();
-  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+  await openNewProjectModalFromProjects(page);
 }
 
 async function expectWorkspaceReady(page: Page) {
   await waitForLoadingToClear(page);
-  await expect(page).toHaveURL(/\/projects\//);
+  await expect(page).toHaveURL(/\/projects\//, { timeout: T.long });
   await expect(page.getByTestId('chat-composer')).toBeVisible();
   await expect(page.getByTestId('chat-composer-input')).toBeVisible();
   await expect(page.getByTestId('file-workspace')).toBeVisible();
@@ -115,9 +140,9 @@ async function sendPrompt(page: Page, prompt: string) {
     page.waitForResponse(
       (response) => {
         const url = new URL(response.url());
-        return url.pathname === '/api/proxy/openai/stream' && response.request().method() === 'POST';
+        return url.pathname === '/api/runs' && response.request().method() === 'POST';
       },
-      { timeout: 10_000 },
+      { timeout: T.long },
     ),
     sendButton.click(),
   ]);

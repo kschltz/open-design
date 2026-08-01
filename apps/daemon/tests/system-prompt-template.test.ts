@@ -45,7 +45,25 @@ describe('composeSystemPrompt — metadata.promptTemplate', () => {
     expect(overrideIdx).toBeGreaterThanOrEqual(0);
     expect(discoveryIdx).toBeGreaterThanOrEqual(0);
     expect(overrideIdx).toBeLessThan(discoveryIdx);
-    expect(out).toMatch(/do NOT emit `<question-form id="discovery">`/);
+    expect(out).toMatch(/do NOT emit a project-opening `<question-form id="discovery">`/);
+  });
+
+  it('pins Plan mode above default artifact discovery and suppresses artifact brief forms', () => {
+    const out = composeSystemPrompt({
+      sessionMode: 'plan',
+      metadata: { kind: 'prototype' },
+    });
+
+    const overrideIdx = out.indexOf('# Plan mode — editable document first');
+    const discoveryIdx = out.indexOf('# OD core directives');
+    expect(overrideIdx).toBeGreaterThanOrEqual(0);
+    expect(discoveryIdx).toBeGreaterThanOrEqual(0);
+    expect(overrideIdx).toBeLessThan(discoveryIdx);
+    expect(out).toContain('do NOT emit `<question-form id="discovery">`');
+    expect(out).toContain('`<question-form id="task-type">`');
+    expect(out).toContain('Quick brief — 30 seconds');
+    expect(out).toContain('<question-form id="plan-brief">');
+    expect(out).toContain('plan-document-specific questions');
   });
 
   it('does not instruct agents to ask for a second visual-direction picker', () => {
@@ -81,14 +99,16 @@ describe('composeSystemPrompt — metadata.promptTemplate', () => {
     expect(out).toContain('license MIT');
   });
 
-  it('asks for image model and aspect ratio when they are unset (not silently defaulted)', () => {
+  it('marks unset image metadata as unresolved without forcing questions', () => {
     const out = composeSystemPrompt({
       metadata: { kind: 'image' },
     });
 
-    // The composer no longer seeds imageModel/imageAspect — the agent must ask.
-    expect(out).toContain('**imageModel**: (unknown — ask: which image model/provider to use)');
-    expect(out).toContain('**aspectRatio**: (unknown — ask: 1:1, 16:9 for landscape, 9:16 for portrait)');
+    expect(out).toContain('**imageModel**: (not provided)');
+    expect(out).toContain(
+      '**aspectRatio**: (not provided; common choices include 1:1, 16:9, or 9:16)',
+    );
+    expect(out).toContain('Missing fields are unresolved facts, not mandatory questions');
     expect(out).not.toContain('gpt-image-2 (default');
     expect(out).not.toContain('1:1 (default');
   });
@@ -394,6 +414,51 @@ describe('composeSystemPrompt — metadata.promptTemplate', () => {
     expect(out).not.toContain('Open Design-owned media execution is **disabled for this run**');
   });
 
+  it('renders BYOK media defaults in the media contract', () => {
+    const out = composeSystemPrompt({
+      metadata: {
+        kind: 'image',
+        imageModel: 'gpt-image-2',
+        imageAspect: '1:1',
+        promptTemplate: { ...baseSummary },
+      },
+      byokMediaDefaults: {
+        imageModel: 'aihubmix-qwen-image-2.0-pro',
+        videoModel: 'aihubmix-doubao-seedance-2-0-260128',
+        speechModel: 'aihubmix-gpt-4o-mini-tts',
+        speechVoice: 'nova',
+      },
+    });
+
+    expect(out).toContain('### Run-scoped BYOK media defaults');
+    expect(out).toContain('- Image model: `aihubmix-qwen-image-2.0-pro`');
+    expect(out).toContain('- Video model: `aihubmix-doubao-seedance-2-0-260128`');
+    expect(out).toContain('- Speech model: `aihubmix-gpt-4o-mini-tts`');
+    expect(out).toContain('- Speech voice: `nova`');
+    expect(out).toContain('### Allowed model IDs (per surface)');
+  });
+
+  it('renders BYOK media defaults in the non-media dispatch hint', () => {
+    const out = composeSystemPrompt({
+      metadata: {
+        kind: 'prototype',
+        platform: 'responsive',
+      },
+      byokMediaDefaults: {
+        imageModel: 'senseaudio-image-1.0-260319',
+      },
+    });
+
+    expect(out).toContain('## Media generation (if asked)');
+    expect(out).toContain('### Run-scoped BYOK media defaults');
+    expect(out).toContain('- Image model: `senseaudio-image-1.0-260319`');
+    expect(out).toContain('IMAGE_MODEL="senseaudio-image-1.0-260319"');
+    expect(out).toContain('--model "$IMAGE_MODEL"');
+    expect(out).toContain('For image generation prefer your configured model: `senseaudio-image-1.0-260319`.');
+    expect(out).not.toContain('--model flux-pro-ultra');
+    expect(out).not.toContain('For the best fal image model use `--model flux-pro-ultra`');
+  });
+
   it('keeps unrestricted enabled media contract unchanged', () => {
     const out = composeSystemPrompt({
       metadata: {
@@ -481,15 +546,23 @@ describe('composeSystemPrompt — metadata.promptTemplate', () => {
       audioVoiceOptions: voiceOptions,
     });
 
-    expect(out).toContain('ElevenLabs voice options');
+    expect(out).toContain('ElevenLabs voice selection policy');
     expect(out).toContain('<question-form id="elevenlabs-voice" title="Choose an ElevenLabs voice">');
     expect(out).toContain('"type": "select"');
+    expect(out).toContain('"allowCustom": false');
     expect(out).toContain('"label": "Rachel — american · female"');
     expect(out).toContain('"value": "21m00Tcm4TlvDq8ikWAM"');
     expect(out).toContain('"label": "Adam — american · male"');
     expect(out).toContain('"label": "Voice 50 — mandarin"');
     expect(out).toContain('"value": "voice-50"');
     expect(out).not.toContain('showing the first 12');
+    expect(out).toContain('If the provider default can safely satisfy the brief');
+    expect(out).toContain(
+      'Only when voice selection would materially change the requested result',
+    );
+    expect(out).toContain(
+      'Conditional template — do not emit unless the voice-selection policy above requires clarification',
+    );
   });
 
   it('surfaces ElevenLabs voice lookup failures for project discovery', () => {

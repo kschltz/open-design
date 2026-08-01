@@ -1,6 +1,8 @@
 export type UiPlaywrightGroup = {
   files: readonly string[];
+  fullyParallel?: boolean;
   grep: string;
+  workers?: number;
 };
 
 export type UiP0CiMatrixEntry = {
@@ -14,13 +16,15 @@ export type VisualCiMatrixEntry = {
 };
 
 export const uiP0Groups = {
-  smoke: {
-    grep: String.raw`\[P0\]`,
-    files: ["ui/critical-smoke.test.ts"],
+  "critical-extras": {
+    grep: "@merge-extra",
+    workers: 1,
+    files: ["ui/app.test.ts"],
   },
   "workspace-restoration": {
+    fullyParallel: true,
     grep: String.raw`\[P0\]`,
-    files: ["ui/app-restoration.test.ts"],
+    files: ["ui/app-restoration.test.ts", "ui/critical-smoke.test.ts"],
   },
   "entry-settings": {
     grep: String.raw`\[P0\]`,
@@ -36,6 +40,7 @@ export const uiP0Groups = {
   },
   "project-workspace": {
     grep: String.raw`\[P0\]`,
+    workers: 1,
     files: [
       "ui/app.test.ts",
       "ui/app-design-files.test.ts",
@@ -46,6 +51,7 @@ export const uiP0Groups = {
   },
   "project-runtime": {
     grep: String.raw`\[P0\]`,
+    workers: 1,
     files: [
       "ui/real-daemon-run.test.ts",
       "ui/amr-run-failure-recovery.test.ts",
@@ -78,6 +84,7 @@ const uiP0CoverageFiles = [
   "ui/app-manual-edit.test.ts",
   "ui/app-restoration.test.ts",
   "ui/app.test.ts",
+  "ui/critical-smoke.test.ts",
   "ui/entry-chrome-flows.test.ts",
   "ui/entry-configuration-flows.test.ts",
   "ui/project-management-flows.test.ts",

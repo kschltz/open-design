@@ -1,16 +1,11 @@
 .root {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
-  border-radius: var(--radius);
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--accent-tint) 50%, var(--bg-panel)) 0%,
-    var(--bg-panel) 60%
-  );
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   animation: next-step-in 200ms cubic-bezier(0.23, 1, 0.32, 1) both;
 }
 
@@ -29,14 +24,6 @@
   .root {
     animation: none;
   }
-}
-
-.label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  color: var(--text-muted);
 }
 
 /* One flat row: Share + iteration directions all sit at the same level. */
@@ -81,7 +68,7 @@
 .toolboxList {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
 }
 
 .toolboxRowWrap {
@@ -92,25 +79,41 @@
 .moreRow {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
-  padding: 6px 8px;
-  font-size: 13px;
+  min-height: 44px;
+  padding: 10px 2px;
+  font-size: 13.5px;
   color: var(--text-default);
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
   cursor: pointer;
   text-align: left;
   transition:
     background 140ms cubic-bezier(0.23, 1, 0.32, 1),
-    border-color 140ms cubic-bezier(0.23, 1, 0.32, 1);
+    color 140ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.toolboxList > :last-child {
+  border-bottom-color: transparent;
 }
 
 .toolboxRow:hover,
 .moreRow:hover {
-  background: var(--accent-tint);
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: var(--bg-subtle);
+}
+
+.toolboxRow:disabled,
+.moreRow:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.toolboxRow:disabled:hover,
+.moreRow:disabled:hover {
+  background: transparent;
 }
 
 .toolboxRow:focus-visible,
@@ -121,7 +124,17 @@
 
 .toolboxRowIcon {
   flex: none;
-  color: var(--accent-strong);
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.toolboxRowText {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
 }
 
 .toolboxRowTitle {
@@ -132,9 +145,15 @@
   white-space: nowrap;
 }
 
+.toolboxRowDescription {
+  display: none;
+}
+
 .toolboxRowArrow {
   flex: none;
-  color: var(--text-muted);
+  width: 16px;
+  height: 16px;
+  color: var(--text-soft);
 }
 
 .moreRow .toolboxRowTitle {
@@ -241,17 +260,17 @@
   width: 200px;
 }
 .flyoutToolbox {
-  width: 300px;
+  width: 286px;
   max-height: min(70vh, 500px);
-  padding: 10px;
+  padding: 8px;
 }
 
 .toolboxFlyoutTitle {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 2px 4px 8px;
-  font-size: 14px;
+  gap: 7px;
+  padding: 1px 4px 6px;
+  font-size: 13px;
   font-weight: 650;
   color: var(--text-default);
 }
@@ -263,11 +282,12 @@
 .flyoutSearch {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  margin-bottom: 8px;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 7px;
+  margin-bottom: 6px;
   border: 1px solid var(--border-strong, var(--border));
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--text-muted);
   background: var(--bg-default);
 }
@@ -276,7 +296,8 @@
   min-width: 0;
   border: 0;
   background: transparent;
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 18px;
   color: var(--text-default);
   outline: none;
 }

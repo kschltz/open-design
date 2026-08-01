@@ -7,8 +7,12 @@ import {
   SIDECAR_MESSAGES,
   normalizeDaemonSidecarMessage,
   type DaemonStatusSnapshot,
+  type DesktopExportArtifactInput,
+  type DesktopExportArtifactResult,
   type DesktopExportPdfInput,
   type DesktopExportPdfResult,
+  type DesktopRenderSlidesInput,
+  type DesktopRenderSlidesResult,
   type MintImportTokenResult,
   type SidecarStamp,
 } from "@open-design/sidecar-proto";
@@ -129,6 +133,30 @@ export async function startDaemonSidecar(runtime: SidecarRuntimeContext<SidecarS
         { timeoutMs: 600_000 },
       );
     },
+    desktopSlideRenderer: async (input: DesktopRenderSlidesInput): Promise<DesktopRenderSlidesResult> => {
+      const desktopIpc = resolveAppIpcPath({
+        app: APP_KEYS.DESKTOP,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        namespace: runtime.namespace,
+      });
+      return await requestJsonIpc<DesktopRenderSlidesResult>(
+        desktopIpc,
+        { input, type: SIDECAR_MESSAGES.RENDER_SLIDES },
+        { timeoutMs: 600_000 },
+      );
+    },
+    desktopArtifactExporter: async (input: DesktopExportArtifactInput): Promise<DesktopExportArtifactResult> => {
+      const desktopIpc = resolveAppIpcPath({
+        app: APP_KEYS.DESKTOP,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        namespace: runtime.namespace,
+      });
+      return await requestJsonIpc<DesktopExportArtifactResult>(
+        desktopIpc,
+        { input, type: SIDECAR_MESSAGES.EXPORT_ARTIFACT },
+        { timeoutMs: 600_000 },
+      );
+    },
     port: parsePort(process.env[DAEMON_PORT_ENV]),
     runtime,
   });
@@ -191,6 +219,19 @@ export async function startDaemonSidecar(runtime: SidecarRuntimeContext<SidecarS
           return { accepted: true };
         case SIDECAR_MESSAGES.MINT_IMPORT_TOKEN:
           return mintImportTokenForCli(request.input.baseDir);
+        case SIDECAR_MESSAGES.REGISTER_WEB_URL: {
+          // Packaged startup binds the web sidecar only after the daemon is
+          // ready, so its dynamic port cannot be delivered in the daemon spawn
+          // environment. The namespace-scoped control plane registers the
+          // actual URL here as soon as web reports ready. Keep OD_WEB_PORT as
+          // the daemon-wide live source because origin validation and MCP
+          // install-info already resolve it per request.
+          const webPort = Number(new URL(request.input.url).port);
+          process.env[WEB_PORT_ENV] = String(webPort);
+          state.trustedWebOriginPort = webPort;
+          state.updatedAt = new Date().toISOString();
+          return { accepted: true };
+        }
       }
     },
   });

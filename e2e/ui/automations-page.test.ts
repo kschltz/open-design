@@ -1,10 +1,11 @@
 import { expect, test } from '@/playwright/suite';
 import { ensureRailOpen } from '@/playwright/rail';
 import { routeAgents } from '@/playwright/mock-factory';
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 
 const STORAGE_KEY = 'open-design:config';
 const OPEN_SETTINGS_LABEL = /Open settings|打开设置|開啟設定/i;
+const AUTOMATIONS_TITLE = /Automations|自动化/i;
 
 test.describe.configure({ timeout: 30_000 });
 
@@ -27,10 +28,14 @@ function baseConfig(): Record<string, unknown> {
   };
 }
 
-async function seedAutomationsBase(page: Page) {
-  await page.addInitScript(({ key, value }) => {
+async function seedAutomationsBase(page: Page, options: { locale?: string } = {}) {
+  await page.addInitScript(({ key, value, locale }) => {
     window.localStorage.setItem(key, JSON.stringify(value));
-  }, { key: STORAGE_KEY, value: baseConfig() });
+    if (locale) {
+      window.localStorage.setItem('open-design:locale', locale);
+      window.localStorage.setItem('open-design:locale-source', 'manual');
+    }
+  }, { key: STORAGE_KEY, value: baseConfig(), locale: options.locale ?? null });
 
   await page.route('**/api/health', async (route) => {
     await route.fulfill({
@@ -72,6 +77,13 @@ async function waitForLoadingToClear(page: Page) {
   await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: 15_000 });
 }
 
+async function openSchedulePopover(modal: Locator, name: RegExp | string) {
+  await modal.getByRole('button', { name }).click();
+  const popover = modal.locator('.automation-popover--schedule');
+  await expect(popover).toBeVisible();
+  return popover;
+}
+
 async function gotoEntryHome(page: Page) {
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await waitForLoadingToClear(page);
@@ -87,7 +99,7 @@ async function gotoAutomations(page: Page) {
   await ensureRailOpen(page);
   await page.getByTestId('entry-nav-tasks').click();
   const view = page.getByTestId('tasks-view');
-  await expect(view.getByRole('heading', { name: 'Automations', exact: true })).toBeVisible();
+  await expect(view.getByRole('heading', { level: 1, name: AUTOMATIONS_TITLE })).toBeVisible();
   return view;
 }
 
@@ -287,8 +299,10 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: 'New automation' }).click();
     const modal = page.getByTestId('automation-modal');
-    await modal.getByLabel('Automation title').fill('Weekly digest');
+    await modal.getByTestId('automation-modal-title').fill('Weekly digest');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Weekly digest');
     await modal.getByTestId('automation-modal-prompt').fill('Summarize GitHub and design activity.');
+    await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue('Summarize GitHub and design activity.');
     await modal.getByRole('button', { name: 'Create' }).click();
 
     await expect(view.getByText('Weekly digest')).toBeVisible();
@@ -417,7 +431,7 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: 'New automation' }).click();
     const modal = page.getByTestId('automation-modal');
-    await modal.getByLabel('Automation title').fill('Newest digest');
+    await modal.getByTestId('automation-modal-title').fill('Newest digest');
     await modal.getByTestId('automation-modal-prompt').fill('Summarize the newest activity.');
     await modal.getByRole('button', { name: 'Create' }).click();
 
@@ -505,14 +519,14 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: 'New automation' }).click();
     const modal = page.getByTestId('automation-modal');
-    await modal.getByLabel('Automation title').fill('Friday launch digest');
+    await modal.getByTestId('automation-modal-title').fill('Friday launch digest');
     await modal.getByTestId('automation-modal-prompt').fill('Summarize launch readiness every Friday.');
-    await modal.getByRole('button', { name: /Daily/i }).click();
-    await page.getByRole('tab', { name: 'Weekly' }).click();
-    await page.locator('.automation-popover__weekdays').getByRole('button', { name: 'Fri' }).click();
-    await page.locator('.automation-popover--schedule input[type="time"]').fill('16:45');
-    await page.locator('.automation-popover--schedule select').selectOption('UTC');
-    await page.getByRole('button', { name: 'Done' }).click();
+    const schedulePopover = await openSchedulePopover(modal, /Daily/i);
+    await schedulePopover.getByRole('tab', { name: 'Weekly' }).click();
+    await schedulePopover.locator('.automation-popover__weekdays').getByRole('button', { name: 'Fri' }).click();
+    await schedulePopover.locator('input[type="time"]').fill('16:45');
+    await schedulePopover.locator('select').selectOption('UTC');
+    await schedulePopover.getByRole('button', { name: 'Done' }).click();
     await expect(modal.getByRole('button', { name: /Friday.*4:45 PM.*UTC/i })).toBeVisible();
 
     await modal.getByRole('button', { name: 'Create' }).click();
@@ -530,6 +544,348 @@ test.describe('Automations page', () => {
         mode: 'create_each_run',
       },
     });
+  });
+
+  test('[P1] renders localized automation schedule summaries in zh-CN', async ({ page }) => {
+    await seedAutomationsBase(page, { locale: 'zh-CN' });
+
+    const now = Date.now();
+    const routines = [
+      {
+        id: 'routine-zh-weekly-1',
+        name: '中文周报',
+        prompt: '总结本周项目进展。',
+        schedule: { kind: 'weekly', weekday: 5, time: '16:45', timezone: 'UTC' },
+        target: { mode: 'create_each_run' },
+        enabled: true,
+        nextRunAt: now + 3600_000,
+        lastRun: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: 'routine-zh-weekdays-1',
+        name: '工作日摘要',
+        prompt: '总结工作日活动。',
+        schedule: { kind: 'weekdays', time: '09:30', timezone: 'UTC' },
+        target: { mode: 'create_each_run' },
+        enabled: true,
+        nextRunAt: now + 7200_000,
+        lastRun: null,
+        createdAt: now - 60_000,
+        updatedAt: now - 60_000,
+      },
+    ];
+
+    await page.route('**/api/projects', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ projects: [] }),
+      });
+    });
+
+    await page.route('**/api/routines', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ routines }),
+      });
+    });
+
+    await page.route('**/api/automation-templates', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ templates: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-proposals?status=pending-review', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ proposals: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-source-packets?limit=3', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ packets: [] }),
+      });
+    });
+
+    const view = await gotoAutomations(page);
+    await expect(view.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
+    await expect(view.getByLabel('你的自动化')).toContainText('中文周报');
+    await expect(view.getByTestId('automation-row-routine-zh-weekly-1')).toContainText('每周五 4:45 下午');
+    await expect(view.getByTestId('automation-row-routine-zh-weekly-1')).toContainText('UTC');
+    await expect(view.getByTestId('automation-row-routine-zh-weekdays-1')).toContainText('周一至周五 9:30 上午');
+  });
+
+  test('[P1] edits an existing automation and persists updated schedule, prompt, and target', async ({ page }) => {
+    await seedAutomationsBase(page);
+
+    const now = Date.now();
+    const projects = [
+      { id: 'proj-1', name: 'Routine Test Project' },
+      { id: 'proj-2', name: 'Launch Room' },
+    ];
+    let routines: Array<Record<string, unknown>> = [
+      {
+        id: 'routine-edit-1',
+        name: 'Daily digest',
+        prompt: 'Summarize GitHub and design activity.',
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        target: { mode: 'create_each_run' },
+        enabled: true,
+        nextRunAt: now + 3600_000,
+        lastRun: null,
+        createdAt: now - 60_000,
+        updatedAt: now - 60_000,
+      },
+    ];
+    const patchBodies: Array<Record<string, unknown>> = [];
+
+    await page.route('**/api/projects', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ projects }),
+      });
+    });
+
+    await page.route('**/api/routines', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ routines }),
+      });
+    });
+
+    await page.route('**/api/routines/routine-edit-1', async (route) => {
+      if (route.request().method() !== 'PATCH') {
+        await route.fulfill({ status: 404, body: '{}' });
+        return;
+      }
+      const payload = route.request().postDataJSON() as Record<string, unknown>;
+      patchBodies.push(payload);
+      const updated = {
+        ...routines[0],
+        ...payload,
+        enabled: true,
+        nextRunAt: now + 7200_000,
+        updatedAt: now,
+      };
+      routines = [updated];
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ routine: updated }),
+      });
+    });
+
+    await page.route('**/api/automation-templates', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ templates: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-proposals?status=pending-review', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ proposals: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-source-packets?limit=3', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ packets: [] }),
+      });
+    });
+
+    const view = await gotoAutomations(page);
+    const row = view.getByTestId('automation-row-routine-edit-1');
+    await row.getByRole('button', { name: 'Edit' }).click();
+
+    const modal = page.getByTestId('automation-modal');
+    await expect(modal).toHaveAttribute('aria-label', 'Edit');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Daily digest');
+    await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue('Summarize GitHub and design activity.');
+
+    await modal.getByRole('button', { name: /New project each run/i }).click();
+    await modal.getByRole('button', { name: 'Launch Room' }).click();
+    await expect(modal.getByRole('button', { name: /Launch Room/i })).toBeVisible();
+
+    const schedulePopover = await openSchedulePopover(modal, /Daily/i);
+    await schedulePopover.getByRole('tab', { name: 'Weekdays' }).click();
+    await schedulePopover.locator('input[type="time"]').fill('10:30');
+    await schedulePopover.locator('select').selectOption('UTC');
+    await schedulePopover.getByRole('button', { name: 'Done' }).click();
+    await expect(modal.getByRole('button', { name: /Runs Mon.*Fri.*10:30 AM.*UTC/i })).toBeVisible();
+
+    await modal.getByTestId('automation-modal-title').fill('Launch digest');
+    await modal.getByTestId('automation-modal-prompt').fill('Summarize launch readiness and open blockers.');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Launch digest');
+    await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue('Summarize launch readiness and open blockers.');
+
+    await modal.getByRole('button', { name: 'Save' }).click();
+    await expect.poll(() => patchBodies.length).toBe(1);
+    expect(patchBodies[0]).toMatchObject({
+      name: 'Launch digest',
+      prompt: 'Summarize launch readiness and open blockers.',
+      schedule: {
+        kind: 'weekdays',
+        time: '10:30',
+        timezone: 'UTC',
+      },
+      target: {
+        mode: 'reuse',
+        projectId: 'proj-2',
+      },
+    });
+
+    await expect(row).toContainText('Launch digest');
+    await expect(row).toContainText('Runs Mon–Fri at 10:30 AM');
+    await expect(row).toContainText('Launch Room');
+    await expect(row).toContainText('Summarize launch readiness and open blockers.');
+  });
+
+  test('[P1] creates a reuse-project automation and opens the reused project after Run', async ({ page }) => {
+    await seedAutomationsBase(page);
+
+    const projects = [
+      { id: 'proj-1', name: 'Routine Test Project' },
+      { id: 'proj-run', name: 'Existing Launch Project' },
+    ];
+    let routines: Array<Record<string, unknown>> = [];
+    const createBodies: Array<Record<string, unknown>> = [];
+
+    await page.route('**/api/projects', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ projects }),
+      });
+    });
+
+    await page.route('**/api/routines', async (route) => {
+      const method = route.request().method();
+      if (method === 'GET') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ routines }),
+        });
+        return;
+      }
+      if (method === 'POST') {
+        const payload = route.request().postDataJSON() as Record<string, unknown>;
+        createBodies.push(payload);
+        const routine = {
+          id: 'routine-reuse-1',
+          name: payload.name,
+          prompt: payload.prompt,
+          schedule: payload.schedule,
+          target: payload.target,
+          enabled: true,
+          nextRunAt: Date.now() + 3600_000,
+          lastRun: null,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        routines = [routine];
+        await route.fulfill({
+          status: 201,
+          contentType: 'application/json',
+          body: JSON.stringify({ routine }),
+        });
+        return;
+      }
+      await route.fulfill({ status: 404, body: '{}' });
+    });
+
+    await page.route('**/api/automation-templates', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ templates: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-proposals?status=pending-review', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ proposals: [] }),
+      });
+    });
+
+    await page.route('**/api/automation-source-packets?limit=3', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ packets: [] }),
+      });
+    });
+
+    await page.route('**/api/routines/routine-reuse-1/run', async (route) => {
+      const startedAt = Date.now();
+      const lastRun = {
+        runId: 'run-reuse-1',
+        status: 'queued',
+        trigger: 'manual',
+        startedAt,
+        projectId: 'proj-run',
+        conversationId: 'conv-reuse',
+        agentRunId: 'agent-run-reuse-1',
+      };
+      routines = [{ ...routines[0], lastRun }];
+      await route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          routine: routines[0],
+          run: lastRun,
+          projectId: 'proj-run',
+          conversationId: 'conv-reuse',
+          agentRunId: 'agent-run-reuse-1',
+        }),
+      });
+    });
+
+    const view = await gotoAutomations(page);
+    await view.getByRole('button', { name: 'New automation' }).click();
+    const modal = page.getByTestId('automation-modal');
+    await modal.getByTestId('automation-modal-title').fill('Reuse launch project');
+    await modal.getByTestId('automation-modal-prompt').fill('Append launch readiness notes.');
+
+    await modal.getByRole('button', { name: /New project each run/i }).click();
+    await modal.getByRole('button', { name: 'Existing Launch Project' }).click();
+    await expect(modal.getByRole('button', { name: /Existing Launch Project/i })).toBeVisible();
+    await modal.getByRole('button', { name: 'Create' }).click();
+
+    await expect.poll(() => createBodies.length).toBe(1);
+    expect(createBodies[0]).toMatchObject({
+      name: 'Reuse launch project',
+      prompt: 'Append launch readiness notes.',
+      target: {
+        mode: 'reuse',
+        projectId: 'proj-run',
+      },
+    });
+
+    const row = view.getByTestId('automation-row-routine-reuse-1');
+    await expect(row).toContainText('Existing Launch Project');
+    await row.getByRole('button', { name: 'Run' }).click();
+    await expect(page).toHaveURL(/\/projects\/proj-run/);
   });
 
   test('[P1] keeps saved automations ordered by newest createdAt first', async ({ page }) => {
@@ -684,11 +1040,11 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: 'New automation' }).click();
     const modal = page.getByTestId('automation-modal');
-    await modal.getByLabel('Automation title').fill('Weekly digest');
+    await modal.getByTestId('automation-modal-title').fill('Weekly digest');
     await modal.getByTestId('automation-modal-prompt').fill('Summarize GitHub and design activity.');
     await modal.getByRole('button', { name: 'Create' }).click();
 
-    await expect(modal.getByLabel('Automation title')).toHaveValue('Weekly digest');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Weekly digest');
     await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue('Summarize GitHub and design activity.');
     await expect(modal.getByText('provider unavailable')).toBeVisible();
     await expect(view.getByText('No automations yet')).toBeVisible();
@@ -1351,8 +1707,8 @@ test.describe('Automations page', () => {
 
     await row.getByRole('button', { name: 'Edit' }).click();
     const modal = page.getByTestId('automation-modal');
-    await expect(modal.getByLabel('Automation title')).toHaveValue('Daily digest');
-    await modal.getByLabel('Automation title').fill('Daily digest edited');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Daily digest');
+    await modal.getByTestId('automation-modal-title').fill('Daily digest edited');
     await modal.getByRole('button', { name: /^Save/i }).click();
 
     await expect(view.getByText('Daily digest edited')).toBeVisible();
@@ -1447,13 +1803,13 @@ test.describe('Automations page', () => {
 
     await row.getByRole('button', { name: 'Edit' }).click();
     const modal = page.getByTestId('automation-modal');
-    await expect(modal.getByLabel('Automation title')).toHaveValue('Daily launch digest');
-    await modal.getByRole('button', { name: /Daily/i }).click();
-    await page.getByRole('tab', { name: 'Weekly' }).click();
-    await page.locator('.automation-popover__weekdays').getByRole('button', { name: 'Tue' }).click();
-    await page.locator('.automation-popover--schedule input[type="time"]').fill('08:15');
-    await page.locator('.automation-popover--schedule select').selectOption('UTC');
-    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Daily launch digest');
+    const schedulePopover = await openSchedulePopover(modal, /Daily/i);
+    await schedulePopover.getByRole('tab', { name: 'Weekly' }).click();
+    await schedulePopover.locator('.automation-popover__weekdays').getByRole('button', { name: 'Tue' }).click();
+    await schedulePopover.locator('input[type="time"]').fill('08:15');
+    await schedulePopover.locator('select').selectOption('UTC');
+    await schedulePopover.getByRole('button', { name: 'Done' }).click();
     await modal.getByRole('button', { name: /^Save/i }).click();
 
     await expect.poll(() => patchBodies.length).toBe(1);
@@ -1627,7 +1983,7 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: /Memory refresh template/i }).click();
     const modal = page.getByTestId('automation-modal');
-    await expect(modal.getByLabel('Automation title')).toHaveValue('Memory refresh template');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Memory refresh template');
     await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue(/Use Automation template "memory-refresh-template"/);
     await expect(modal.getByTestId('automation-modal-prompt')).toHaveValue(/Pipeline: Collect source packets -> Compact durable context -> Update memory/);
 
@@ -1745,15 +2101,15 @@ test.describe('Automations page', () => {
 
     await view.getByRole('button', { name: /Design system watch template/i }).click();
     const modal = page.getByTestId('automation-modal');
-    await expect(modal.getByLabel('Automation title')).toHaveValue('Design system watch template');
+    await expect(modal.getByTestId('automation-modal-title')).toHaveValue('Design system watch template');
     await modal.getByRole('button', { name: /New project each run/i }).click();
     await page.getByRole('button', { name: 'Template Target Project' }).click();
-    await modal.getByRole('button', { name: /Daily/i }).click();
-    await page.getByRole('tab', { name: 'Weekly' }).click();
-    await page.locator('.automation-popover__weekdays').getByRole('button', { name: 'Thu' }).click();
-    await page.locator('.automation-popover--schedule input[type="time"]').fill('13:30');
-    await page.locator('.automation-popover--schedule select').selectOption('UTC');
-    await page.getByRole('button', { name: 'Done' }).click();
+    const schedulePopover = await openSchedulePopover(modal, /Daily/i);
+    await schedulePopover.getByRole('tab', { name: 'Weekly' }).click();
+    await schedulePopover.locator('.automation-popover__weekdays').getByRole('button', { name: 'Thu' }).click();
+    await schedulePopover.locator('input[type="time"]').fill('13:30');
+    await schedulePopover.locator('select').selectOption('UTC');
+    await schedulePopover.getByRole('button', { name: 'Done' }).click();
 
     await modal.getByRole('button', { name: 'Create' }).click();
     await expect.poll(() => createBodies.length).toBe(1);

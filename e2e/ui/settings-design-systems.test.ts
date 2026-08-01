@@ -93,6 +93,10 @@ async function routeBootstrapApis(
       });
       return;
     }
+    if (path === '/api/editors') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"editors":[]}' });
+      return;
+    }
     if (path === '/api/app-config') {
       if (method === 'GET') {
         await route.fulfill({
@@ -122,7 +126,11 @@ async function routeBootstrapApis(
       return;
     }
     if (path === '/api/skills') {
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{"skills":[]}' });
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: '{"skills":[]}',
+      });
       return;
     }
     if (path === '/api/design-systems' && method === 'GET') {

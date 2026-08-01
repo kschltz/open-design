@@ -7,25 +7,34 @@ import {
   trackProjectCreateResult,
 } from './analytics/events';
 import { deriveUploadCohort } from './analytics/upload-tracking';
+import { setPendingDesignSystemCreateEntry } from './analytics/ds-create-entry';
 import { detectClientType } from './analytics/identity';
 import {
+  stashOnboardingEntryForProject,
+  type OnboardingEntry,
+} from './onboarding/onboarding-entry';
+import {
   deriveConfigureGlobals,
-  projectKindToTracking,
+  projectKindFromMetadataToTracking,
   fidelityToTracking,
 } from '@open-design/contracts/analytics';
-import type { AmrModelsResponse, ChatSessionMode } from '@open-design/contracts';
+import type { AmrModelsResponse, ChatSessionMode, RunContextSelection } from '@open-design/contracts';
+import { DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID } from '@open-design/contracts';
 import { EntryView } from './components/EntryView';
 import type { IntegrationTab } from './components/IntegrationsView';
 import { MarketplaceView } from './components/MarketplaceView';
 import { PluginDetailView } from './components/PluginDetailView';
 import type { CreateInput, ImportClaudeDesignOutcome } from './components/NewProjectPanel';
 import { MemoryToast } from './components/MemoryToast';
+import { UpdateDialog } from './components/UpdateDialog';
 import { Toast } from './components/Toast';
 import { CenteredLoader } from './components/Loading';
 import { PetOverlay, type PetTaskCenter } from './components/pet/PetOverlay';
 import { buildPetTaskCenter } from './components/pet/taskCenter';
 import { migrateCustomPetAtlas } from './components/pet/pets';
 import { ProjectView } from './components/ProjectView';
+import { AmrArtifactUpgradeGate } from './components/AmrArtifactUpgradeGate';
+import { AmrArtifactUpgradeHomeCard } from './components/AmrArtifactUpgradeHomeCard';
 import { TooltipLayer } from './components/TooltipLayer';
 import { openWorkspaceTab, WorkspaceTabsBar } from './components/WorkspaceTabsBar';
 import {
@@ -52,9 +61,11 @@ import {
   fetchDesignTemplates,
   fetchPromptTemplates,
   fetchSkills,
+  openExternalUrl,
   uploadProjectFiles,
   replaceProjectWorkingDir,
 } from './providers/registry';
+import { openFirstPartyExternalLinkFromClick } from './first-party-external-link';
 import {
   RUNS_CHANGED_EVENT,
   fetchAmrModels,
@@ -66,25 +77,37 @@ import { AMR_LOGIN_STATUS_EVENT } from './components/amrLoginPolling';
 import { navigate, useRoute } from './router';
 import {
   fetchDaemonConfig,
+  fetchByokCredentialProfilesFromDaemon,
   DEFAULT_PET,
   fetchMediaProvidersFromDaemon,
   hasAnyConfiguredProvider,
   fetchComposioConfigFromDaemon,
+  legacyByokMigrationErrorPresentation,
   loadConfig,
+  migrateLegacyByokCredentialsToDaemon,
   mergeDaemonConfig,
+  mergeByokCredentialProfiles,
   mergeDaemonMediaProviders,
   saveConfig,
+  persistByokCredentialProfileToDaemon,
   shouldSyncLocalMediaProvidersToDaemon,
   syncComposioConfigToDaemon,
   syncConfigToDaemon,
   syncMediaProvidersToDaemon,
 } from './state/config';
+import { createSilentUpdatePreferenceWriter } from './state/silent-update-preference';
 import { applyAppearanceToDocument } from './state/appearance';
 import { isMacPlatform } from './utils/platform';
 import {
+  amrArtifactUpgradeHomeMockOffer,
+  type AmrArtifactUpgradeHomeOffer,
+} from './runtime/amr-artifact-upgrade';
+import {
+  createDesignSystemProjectFromProject,
   createProject,
   createPluginShareProject,
   deleteProject as deleteProjectApi,
+  duplicateProject,
   getProject,
   importClaudeDesignZip,
   importFolderProject,
@@ -111,11 +134,33 @@ import type {
   DesignSystemGenerationJob,
   DesignSystemSummary,
   Project,
+  ProjectMetadata,
   ProjectTemplate,
   ProviderModelOption,
   PromptTemplateSummary,
   SkillSummary,
 } from './types';
+
+type AppCreateProjectInput = Omit<CreateInput, 'metadata'> & {
+  metadata?: CreateInput['metadata'];
+  pendingPrompt?: string;
+  pluginId?: string;
+  pluginType?: string;
+  appliedPluginSnapshotId?: string;
+  pluginInputs?: Record<string, unknown>;
+  initialRunContext?: RunContextSelection | null;
+  conversationMode?: ChatSessionMode;
+  autoSendFirstMessage?: boolean;
+  /** The home submit already ran the Open Design Cloud balance gate (and the
+   *  user acknowledged any soft warning), so the project's first auto-send
+   *  must not re-gate — re-prompting a decision the user just made. */
+  amrGatePrechecked?: boolean;
+  requestId?: string;
+  pendingFiles?: File[];
+  userWorkingDirToken?: string;
+  linkedDirs?: string[] | null;
+  onboardingEntry?: OnboardingEntry;
+};
 
 const APP_CONFIG_CHANGED_EVENT = 'open-design:app-config-changed';
 const AMR_AGENT_ID = 'amr';
@@ -147,12 +192,40 @@ function amrProfileForConfig(config: AppConfig): string | null {
   return typeof profile === 'string' && profile ? profile : null;
 }
 
+function mergeLinkedDirsIntoMetadata(
+  metadata: ProjectMetadata | undefined,
+  linkedDirs?: string[] | null,
+): ProjectMetadata | undefined {
+  const nextDirs = (linkedDirs ?? []).map((dir) => dir.trim()).filter(Boolean);
+  if (nextDirs.length === 0) return metadata;
+  const baseMetadata = metadata ?? { kind: 'other' };
+  return {
+    ...baseMetadata,
+    linkedDirs: Array.from(new Set([...(baseMetadata.linkedDirs ?? []), ...nextDirs])),
+  };
+}
+
 function sameAgentModelChoice(
   left: AgentModelChoice | undefined,
   right: AgentModelChoice | undefined,
 ): boolean {
   return (left?.model ?? null) === (right?.model ?? null)
-    && (left?.reasoning ?? null) === (right?.reasoning ?? null);
+    && (left?.reasoning ?? null) === (right?.reasoning ?? null)
+    && (left?.serviceTier ?? null) === (right?.serviceTier ?? null);
+}
+
+export function mergeAgentModelChoice(
+  previous: AgentModelChoice | undefined,
+  next: { model?: string; reasoning?: string; serviceTier?: string },
+): AgentModelChoice {
+  const merged = { ...(previous ?? {}), ...next };
+  if (
+    Object.prototype.hasOwnProperty.call(next, 'serviceTier') &&
+    next.serviceTier === undefined
+  ) {
+    delete merged.serviceTier;
+  }
+  return merged;
 }
 
 function clearStaleAmrModelChoiceOnProfileChange(
@@ -338,6 +411,15 @@ function AppInner() {
   const iframeKeepAlivePool = useIframeKeepAlivePool();
   const clientType = useMemo(() => detectClientType(), []);
   useModalWindowDragGuard();
+  useEffect(() => {
+    const onFirstPartyExternalLink = (event: MouseEvent) => openFirstPartyExternalLinkFromClick(
+      event,
+      (url) => { void openExternalUrl(url); },
+    );
+    // React handlers append AMR attribution while the event bubbles; bridge the final URL afterwards.
+    document.addEventListener('click', onFirstPartyExternalLink);
+    return () => document.removeEventListener('click', onFirstPartyExternalLink);
+  }, []);
   // Observability marker. `apps/web/src/observability/white-screen.ts`
   // keys its "app actually mounted" success condition on this attribute
   // because the dynamic-import loading shell (`<div class="od-loading-shell">
@@ -348,6 +430,7 @@ function AppInner() {
   useEffect(() => {
     if (typeof document !== 'undefined') {
       document.documentElement.setAttribute('data-od-app-mounted', '1');
+      document.querySelectorAll('.od-loading-shell').forEach((node) => node.remove());
     }
   }, []);
   const [config, setConfig] = useState<AppConfig>(() => loadConfig());
@@ -355,13 +438,24 @@ function AppInner() {
   configRef.current = config;
   const latestPersistedConfigRef = useRef(config);
   latestPersistedConfigRef.current = config;
+  const settingsDraftConfigRef = useRef<AppConfig | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [amrArtifactUpgradeHomeMockConfig] = useState<AmrArtifactUpgradeHomeOffer | null>(
+    () => process.env.NODE_ENV === 'development' && typeof window !== 'undefined'
+      ? amrArtifactUpgradeHomeMockOffer(window.location.search)
+      : null,
+  );
+  const amrArtifactUpgradeHomeMock = amrArtifactUpgradeHomeMockConfig !== null;
+  const [amrArtifactUpgradeHomeOffer, setAmrArtifactUpgradeHomeOffer] =
+    useState<AmrArtifactUpgradeHomeOffer | null>(() => amrArtifactUpgradeHomeMockConfig);
   // Surfaced when a Home-picked working dir could not be applied to a freshly
   // created project (expired/invalid desktop token, daemon rejection). Without
   // this the failure was swallowed and the user believed their folder was in
   // effect while the project actually stayed in the managed root.
   const [workingDirError, setWorkingDirError] = useState<string | null>(null);
   const [projectOpenError, setProjectOpenError] = useState<string | null>(null);
+  const [legacyByokMigrationError, setLegacyByokMigrationError] =
+    useState<Error | null>(null);
   const [settingsWelcome, setSettingsWelcome] = useState(false);
   const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>('execution');
   const [settingsHighlight, setSettingsHighlight] = useState<SettingsHighlight>(null);
@@ -431,6 +525,10 @@ function AppInner() {
   // so they don't race ahead of the daemon-stored choice and overwrite it
   // with a freshly picked first-available agent.
   const [daemonConfigLoaded, setDaemonConfigLoaded] = useState(false);
+  // True only when GET /api/app-config returned a real config object. Used to
+  // gate silent-update default seeding: a failed/null fetch must not be treated
+  // as "no preference yet" or we would overwrite a daemon-backed opt-out.
+  const [daemonAppConfigReady, setDaemonAppConfigReady] = useState(false);
   // Narrower flag dedicated to the Composio API key hydration. The key is
   // persisted by the daemon (and only reflected back via apiKeyConfigured
   // + apiKeyTail), so after a dev-server restart there is a window where
@@ -583,6 +681,32 @@ function AppInner() {
   // globals effect below reads it; the sync effects live next to the
   // other AMR plumbing further down.
   const [amrLoginStatus, setAmrLoginStatus] = useState<VelaLoginStatus | null>(null);
+  const resolvedAmrPlan =
+    amrLoginStatus?.account?.plan?.trim()
+    || amrLoginStatus?.user?.plan?.trim()
+    || null;
+  // Child surfaces report status snapshots, not login events. Deduplicate the
+  // signed-in transition here: restarting the model poll for every Settings
+  // snapshot updates `agents`, which makes Settings fetch status again and
+  // creates a status -> models -> agents request loop.
+  const amrLoginStatusRef = useRef<VelaLoginStatus | null>(null);
+  const applyAmrLoginStatus = useCallback((
+    status: VelaLoginStatus,
+    options: { forceModelRefresh?: boolean; restartOnSignIn?: boolean } = {},
+  ) => {
+    const wasLoggedIn = amrLoginStatusRef.current?.loggedIn === true;
+    amrLoginStatusRef.current = status;
+    setAmrLoginStatus(status);
+    if (
+      status.loggedIn === true
+      && (
+        options.forceModelRefresh === true
+        || (options.restartOnSignIn === true && !wasLoggedIn)
+      )
+    ) {
+      restartAmrPolling();
+    }
+  }, [restartAmrPolling]);
 
   // v2 analytics requires every event to carry the configure-state
   // triplet (has_available_configure_cli / configure_type /
@@ -724,20 +848,36 @@ function AppInner() {
   // unmounted before their poll settled.
   useEffect(() => {
     let cancelled = false;
-    const sync = async () => {
-      const status = await fetchVelaLoginStatus();
-      if (!cancelled && status) setAmrLoginStatus(status);
+    const sync = async (
+      options: { refresh?: boolean } = {},
+      restartOnSignIn = false,
+    ) => {
+      const status = await fetchVelaLoginStatus(options);
+      if (!cancelled && status) {
+        applyAmrLoginStatus(status, {
+          forceModelRefresh: options.refresh === true,
+          restartOnSignIn,
+        });
+      }
     };
     void sync();
     const onStatusEvent = () => {
-      void sync();
+      void sync({}, true);
+    };
+    const onReturnToApp = () => {
+      if (document.visibilityState === 'hidden') return;
+      void sync({ refresh: true });
     };
     window.addEventListener(AMR_LOGIN_STATUS_EVENT, onStatusEvent);
+    window.addEventListener('focus', onReturnToApp);
+    document.addEventListener('visibilitychange', onReturnToApp);
     return () => {
       cancelled = true;
       window.removeEventListener(AMR_LOGIN_STATUS_EVENT, onStatusEvent);
+      window.removeEventListener('focus', onReturnToApp);
+      document.removeEventListener('visibilitychange', onReturnToApp);
     };
-  }, [daemonLive]);
+  }, [applyAmrLoginStatus, daemonLive]);
 
   useEffect(() => {
     analytics.setUserId(
@@ -746,10 +886,8 @@ function AppInner() {
   }, [analytics.setUserId, amrLoginStatus]);
 
   const handleAmrLoginStatusChange = useCallback((status: VelaLoginStatus | null) => {
-    if (status) setAmrLoginStatus(status);
-    if (status?.loggedIn !== true) return;
-    restartAmrPolling();
-  }, [restartAmrPolling]);
+    if (status) applyAmrLoginStatus(status, { restartOnSignIn: true });
+  }, [applyAmrLoginStatus]);
 
   // Bootstrap — detect daemon, then fan out independent fetches so each
   // entry-view tab can render the moment its own data lands. Earlier this
@@ -772,6 +910,7 @@ function AppInner() {
         setProjectsLoading(false);
         setPromptTemplatesLoading(false);
         setDaemonConfigLoaded(true);
+        setDaemonAppConfigReady(false);
         // Composio hydration also depends on the daemon. With no daemon
         // we just keep whatever localStorage already held; drop the
         // skeleton so the Settings → Connectors input reflects state.
@@ -868,6 +1007,21 @@ function AppInner() {
         setAppVersionInfo(info);
       });
 
+      const legacyByokMigration =
+        await migrateLegacyByokCredentialsToDaemon(
+          latestPersistedConfigRef.current,
+        );
+      if (cancelled) return;
+      setLegacyByokMigrationError(
+        legacyByokMigration.status === 'failed'
+          ? legacyByokMigration.error
+          : null,
+      );
+      const migrationBaseConfig = legacyByokMigration.config;
+      if (legacyByokMigration.status === 'migrated') {
+        latestPersistedConfigRef.current = migrationBaseConfig;
+      }
+
       // Daemon-persisted config + composio config + media provider config land
       // together so the welcome-modal decision and daemon-backed settings
       // apply in one merge, avoiding a flash where local-only state is shown
@@ -876,10 +1030,14 @@ function AppInner() {
         fetchDaemonConfig(),
         fetchComposioConfigFromDaemon(),
         fetchMediaProvidersFromDaemon(),
+        migrationBaseConfig.byokProfileId
+          ? fetchByokCredentialProfilesFromDaemon()
+          : Promise.resolve(null),
       ]).then(([
         daemonConfig,
         daemonComposioConfig,
         daemonMediaProvidersResult,
+        byokCredentialProfiles,
       ]) => {
         if (cancelled) return;
         const daemonMediaProvidersLoaded =
@@ -893,34 +1051,35 @@ function AppInner() {
             ? t('settings.mediaProviderLoadError')
             : null,
         );
-        // Compute the next config outside the setConfig updater so we can
-        // both (a) call navigate() after setConfig returns — calling it
-        // inside the updater would trigger a Router setState during React's
-        // render phase — and (b) read next.onboardingCompleted synchronously,
-        // since React batches setConfig and the updater doesn't run until
-        // the next render. latestPersistedConfigRef is kept in sync with
-        // the rendered config and is safe to read here.
+        // Settings remain interactive while daemon hydration is in flight.
+        // Rebase the daemon response on the latest persisted state so a
+        // completed user write cannot be overwritten by the boot snapshot.
         const baseConfig = latestPersistedConfigRef.current;
         const migratedLocalMediaProviders = shouldSyncLocalMediaProvidersToDaemon(
           baseConfig.mediaProviders,
           daemonMediaProvidersLoaded,
         );
-        const next = mergeDaemonMediaProviders(
-          clearStaleAmrModelChoiceOnProfileChange(
-            baseConfig,
-            mergeDaemonConfig(baseConfig, daemonConfig),
+        const next = mergeByokCredentialProfiles(
+          mergeDaemonMediaProviders(
+            clearStaleAmrModelChoiceOnProfileChange(
+              baseConfig,
+              mergeDaemonConfig(baseConfig, daemonConfig),
+            ),
+            daemonMediaProvidersLoaded,
           ),
-          daemonMediaProvidersLoaded,
+          byokCredentialProfiles,
         );
         const hasLocalComposioKey = Boolean(next.composio?.apiKey?.trim());
         if (!hasLocalComposioKey && daemonComposioConfig) {
           next.composio = daemonComposioConfig;
         }
-        saveConfig(next);
+        if (legacyByokMigration.status !== 'failed') {
+          saveConfig(next);
+        }
         if (
-          daemonMediaProvidersResult.status === 'ok' &&
-          migratedLocalMediaProviders &&
-          hasAnyConfiguredProvider(next.mediaProviders)
+          daemonMediaProvidersResult.status === 'ok'
+          && migratedLocalMediaProviders
+          && hasAnyConfiguredProvider(next.mediaProviders)
         ) {
           void syncMediaProvidersToDaemon(next.mediaProviders, {
             daemonProviders: daemonMediaProvidersLoaded,
@@ -944,10 +1103,12 @@ function AppInner() {
           navigate({ kind: 'home', view: 'onboarding' }, { replace: true });
         }
         setDaemonConfigLoaded(true);
+        // Only a non-null GET payload means we actually observed daemon prefs.
+        setDaemonAppConfigReady(daemonConfig != null);
         // Composio key hydration is part of this same daemon-config
         // fetch — by the time we land here the daemon has either
         // returned the saved-key shape (apiKeyConfigured + tail) or
-        // it errored and we kept whatever localStorage held. Either
+        // it errored and we kept whatever localStorage already held. Either
         // way it is safe to drop the skeleton.
         setComposioConfigLoading(false);
       });
@@ -1097,6 +1258,35 @@ function AppInner() {
   }, []);
 
   /**
+   * Non-optimistic, serialized write for the daemon-owned silent-update
+   * preference. Concurrent Settings / popup toggles cannot commit out of
+   * order: only the latest request applies to app state after its daemon
+   * write succeeds.
+   */
+  const silentUpdatePreferenceWriterRef = useRef(
+    createSilentUpdatePreferenceWriter<AppConfig>({
+      readBase: () => latestPersistedConfigRef.current,
+      writeDaemon: async (next) => {
+        await syncConfigToDaemon(next, { throwOnError: true });
+      },
+      commit: (allowSilentUpdates) => {
+        const next: AppConfig = {
+          ...latestPersistedConfigRef.current,
+          allowSilentUpdates,
+        };
+        latestPersistedConfigRef.current = next;
+        setConfig((prev) => ({ ...prev, allowSilentUpdates }));
+        // saveConfig strips daemon-owned keys from localStorage; in-memory
+        // config still carries allowSilentUpdates for the rest of the session.
+        saveConfig(next);
+      },
+    }),
+  );
+  const handleSilentUpdatePreferenceChange = useCallback(async (allowSilentUpdates: boolean) => {
+    await silentUpdatePreferenceWriterRef.current.write(allowSilentUpdates);
+  }, []);
+
+  /**
    * Autosave-driven persistence path. The settings dialog calls this on
    * every committed edit (via a debounced effect) so localStorage and
    * the daemon stay in lock-step with the user's draft. We deliberately
@@ -1113,7 +1303,16 @@ function AppInner() {
     // a half-typed key can't survive in localStorage. If the dialog is
     // closing, preserve any onboarding completion that the close gesture
     // already committed so an unmount autosave cannot re-open the welcome flow.
-    const persisted = buildPersistedConfig(next, configRef.current);
+    //
+    // allowSilentUpdates is daemon-owned and must not be applied optimistically:
+    // keep the previous value in memory until the daemon write succeeds.
+    const prevSilent = latestPersistedConfigRef.current.allowSilentUpdates;
+    const nextSilent = next.allowSilentUpdates;
+    const silentChanged = nextSilent !== prevSilent;
+    const nextForOptimistic = silentChanged
+      ? { ...next, allowSilentUpdates: prevSilent }
+      : next;
+    const persisted = buildPersistedConfig(nextForOptimistic, configRef.current);
     latestPersistedConfigRef.current = persisted;
     saveConfig(persisted);
     setConfig(persisted);
@@ -1122,6 +1321,9 @@ function AppInner() {
       && shouldSyncMediaProvidersOnSave(persisted.mediaProviders, {
         force: options?.forceMediaProviderSync,
       });
+    const daemonPayload = silentChanged
+      ? { ...persisted, allowSilentUpdates: nextSilent }
+      : persisted;
     await Promise.all([
       shouldSyncMediaProviders
         ? syncMediaProvidersToDaemon(persisted.mediaProviders, {
@@ -1130,9 +1332,37 @@ function AppInner() {
             throwOnError: options?.forceMediaProviderSync,
           })
         : Promise.resolve(),
-      syncConfigToDaemon(persisted, { throwOnError: true }),
+      syncConfigToDaemon(daemonPayload, { throwOnError: true }),
     ]);
+    if (silentChanged) {
+      latestPersistedConfigRef.current = {
+        ...latestPersistedConfigRef.current,
+        allowSilentUpdates: nextSilent,
+      };
+      setConfig((curr) => ({ ...curr, allowSilentUpdates: nextSilent }));
+    }
   }, [daemonMediaProviders, daemonMediaProvidersFetchState]);
+
+  const handleSettingsDraftChange = useCallback((draft: AppConfig) => {
+    settingsDraftConfigRef.current = draft;
+  }, []);
+
+  const handlePrivacyConsentChoice = useCallback((share: boolean) => {
+    const base = settingsDraftConfigRef.current ?? latestPersistedConfigRef.current;
+    const installationId = share
+      ? base.installationId ?? generateInstallationIdSafe()
+      : null;
+    void handleConfigPersist({
+      ...base,
+      installationId,
+      privacyDecisionAt: Date.now(),
+      telemetry: {
+        ...(base.telemetry ?? {}),
+        metrics: share,
+        content: share,
+      },
+    });
+  }, [handleConfigPersist]);
 
   /**
    * Explicit Composio API-key save. Called from the section-local
@@ -1143,23 +1373,25 @@ function AppInner() {
    */
   const handleConfigPersistComposioKey = useCallback(
     async (composio: AppConfig['composio']) => {
-      const next = await persistComposioConfigChange(config, composio);
-      setConfig((curr) => {
-        const merged: AppConfig = { ...curr, composio: next.composio };
-        saveConfig(merged);
-        return merged;
-      });
+      const next = await persistComposioConfigChange(
+        latestPersistedConfigRef.current,
+        composio,
+      );
+      latestPersistedConfigRef.current = next;
+      saveConfig(next);
+      setConfig(next);
     },
-    [config],
+    [],
   );
 
   const handleModeChange = useCallback(
     (mode: AppConfig['mode']) => {
-      const next = { ...config, mode };
+      const next = { ...latestPersistedConfigRef.current, mode };
+      latestPersistedConfigRef.current = next;
       saveConfig(next);
       setConfig(next);
     },
-    [config],
+    [],
   );
 
   // Quick theme switch from the settings dropdown in the entry view.
@@ -1188,28 +1420,31 @@ function AppInner() {
 
   const handleAgentChange = useCallback(
     (agentId: string) => {
-      const next = { ...config, agentId };
+      const next = { ...latestPersistedConfigRef.current, agentId };
+      latestPersistedConfigRef.current = next;
       saveConfig(next);
       void syncConfigToDaemon(next);
       setConfig(next);
     },
-    [config],
+    [],
   );
 
   const handleAgentModelChange = useCallback(
-    (agentId: string, choice: { model?: string; reasoning?: string }) => {
-      const prev = config.agentModels?.[agentId] ?? {};
-      const merged = { ...prev, ...choice };
+    (agentId: string, choice: { model?: string; reasoning?: string; serviceTier?: string }) => {
+      const current = latestPersistedConfigRef.current;
+      const prev = current.agentModels?.[agentId] ?? {};
+      const merged = mergeAgentModelChoice(prev, choice);
       const nextAgentModels = {
-        ...(config.agentModels ?? {}),
+        ...(current.agentModels ?? {}),
         [agentId]: merged,
       };
-      const next = { ...config, agentModels: nextAgentModels };
+      const next = { ...current, agentModels: nextAgentModels };
+      latestPersistedConfigRef.current = next;
       saveConfig(next);
       void syncConfigToDaemon(next);
       setConfig(next);
     },
-    [config],
+    [],
   );
 
   // BYOK protocol switch — also flips `mode` to 'api' so the user does
@@ -1336,18 +1571,7 @@ function AppInner() {
 
   const handleCreateProject = useCallback(
     async (
-      input: CreateInput & {
-        pendingPrompt?: string;
-        pluginId?: string;
-        pluginType?: string;
-        appliedPluginSnapshotId?: string;
-        pluginInputs?: Record<string, unknown>;
-        conversationMode?: ChatSessionMode;
-        autoSendFirstMessage?: boolean;
-        requestId?: string;
-        pendingFiles?: File[];
-        userWorkingDirToken?: string;
-      },
+      input: AppCreateProjectInput,
     ): Promise<boolean> => {
       // Honor an explicit `null` design system — the create panel defaults
       // to "None" for every kind now, and the user expects that to land
@@ -1357,8 +1581,9 @@ function AppInner() {
       input.pendingPrompt ??
       (input.metadata?.promptTemplate?.prompt?.trim() || undefined);
 
-      const kind = input.metadata?.kind ?? null;
-      const fidelity = fidelityToTracking(input.metadata?.fidelity ?? null);
+      const metadata = mergeLinkedDirsIntoMetadata(input.metadata, input.linkedDirs);
+      const kind = metadata?.kind ?? null;
+      const fidelity = fidelityToTracking(metadata?.fidelity ?? null);
       const creationSource: 'blank' | 'template' | 'zip' | 'folder' =
         kind === 'template' ? 'template' : 'blank';
       let result;
@@ -1368,7 +1593,7 @@ function AppInner() {
           skillId: input.skillId,
           designSystemId: input.designSystemId,
           pendingPrompt: derivedPendingPrompt,
-          metadata: input.metadata,
+          metadata,
           ...(input.conversationMode ? { conversationMode: input.conversationMode } : {}),
           ...(input.pluginId ? { pluginId: input.pluginId } : {}),
           ...(input.appliedPluginSnapshotId
@@ -1388,7 +1613,7 @@ function AppInner() {
             area: 'new_project',
             project_source: 'create_button',
             project_id: null,
-            project_kind: projectKindToTracking(kind),
+            project_kind: projectKindFromMetadataToTracking(metadata),
             fidelity,
             result: 'failed',
             error_code: errorCode,
@@ -1405,7 +1630,7 @@ function AppInner() {
             area: 'new_project',
             project_source: 'create_button',
             project_id: null,
-            project_kind: projectKindToTracking(kind, input.metadata?.videoModel),
+            project_kind: projectKindFromMetadataToTracking(metadata),
             fidelity,
             ...(input.pluginId ? { plugin_id: input.pluginId } : {}),
             ...(input.pluginType ? { plugin_type: input.pluginType } : {}),
@@ -1427,7 +1652,7 @@ function AppInner() {
       // from Design Files and the first auto-send context once the working
       // dir flips. Doing the handoff first means the initial upload lands in
       // the final tree.
-      const userWorkingDir = input.metadata?.userWorkingDir;
+      const userWorkingDir = metadata?.userWorkingDir;
       let workingDirHandoffFailed = false;
       if (userWorkingDir) {
         try {
@@ -1485,7 +1710,7 @@ function AppInner() {
           area: 'new_project',
           project_source: 'create_button',
           project_id: result.project.id,
-          project_kind: projectKindToTracking(kind, input.metadata?.videoModel),
+          project_kind: projectKindFromMetadataToTracking(metadata),
           fidelity,
           ...(input.pluginId ? { plugin_id: input.pluginId } : {}),
           ...(input.pluginType ? { plugin_type: input.pluginType } : {}),
@@ -1508,6 +1733,16 @@ function AppInner() {
             `od:auto-send-first:${result.project.id}`,
             '1',
           );
+          if (input.amrGatePrechecked) {
+            window.sessionStorage.setItem(
+              `od:auto-send-amr-gate-ok:${result.project.id}`,
+              '1',
+            );
+          } else {
+            window.sessionStorage.removeItem(
+              `od:auto-send-amr-gate-ok:${result.project.id}`,
+            );
+          }
           if (firstMessageAttachments.length > 0) {
             window.sessionStorage.setItem(
               `od:auto-send-attachments:${result.project.id}`,
@@ -1518,10 +1753,37 @@ function AppInner() {
               `od:auto-send-attachments:${result.project.id}`,
             );
           }
+          if (input.initialRunContext && Object.keys(input.initialRunContext).length > 0) {
+            window.sessionStorage.setItem(
+              `od:auto-send-context:${result.project.id}`,
+              JSON.stringify(input.initialRunContext),
+            );
+          } else {
+            window.sessionStorage.removeItem(
+              `od:auto-send-context:${result.project.id}`,
+            );
+          }
         } catch {
           /* sessionStorage may be unavailable (e.g. SSR / private mode); fall
              back to manual send. */
         }
+      }
+      // Home recommendation handoff: now that the project exists and its id is
+      // known, stash the onboarding entry keyed by that id. Studio consumes it
+      // by the same id on mount. Keying by id (instead of a single global slot
+      // written before create) removes the race where opening an unrelated
+      // project mid-create could steal the personalized funnel context, and
+      // means a failed/aborted create leaves nothing behind.
+      if (input.onboardingEntry) {
+        // Cache the prefilled seed prompt WITH the entry so the first-prompt
+        // funnel's `has_prefilled_prompt` comparison base survives a
+        // reopen-before-send (project.pendingPrompt is wiped on first mount).
+        stashOnboardingEntryForProject(result.project.id, {
+          ...input.onboardingEntry,
+          ...(derivedPendingPrompt
+            ? { seedPrompt: derivedPendingPrompt.trim() }
+            : {}),
+        });
       }
       const project = result.appliedPluginSnapshotId
         ? {
@@ -1546,6 +1808,82 @@ function AppInner() {
       return true;
     },
     [analytics.track, rememberLocalProject],
+  );
+
+  const handleCreateProjectFromDesignSystem = useCallback(
+    async (designSystemId: string, designSystemTitle: string) => {
+      // "Create with this design system" must NOT assume a prototype. Route
+      // the click through the hidden default design router (od-default) —
+      // exactly like a free-form Home prompt. The preset prompt seeds the
+      // conversation and is auto-sent so the router can infer the task type
+      // from the brief, asking only when the route remains ambiguous. `kind`
+      // stays the neutral 'other' so no surface-specific default leaks back
+      // in on the daemon side.
+      const presetPrompt = t('nextStep.brandCreateDesignPrompt', {
+        designSystem: designSystemTitle,
+      });
+      await handleCreateProject({
+        name: t('common.untitled'),
+        skillId: null,
+        designSystemId,
+        pluginId: DEFAULT_UNSELECTED_SCENARIO_PLUGIN_ID,
+        pluginInputs: { prompt: presetPrompt },
+        pendingPrompt: presetPrompt,
+        autoSendFirstMessage: true,
+        conversationMode: 'design',
+        metadata: {
+          kind: 'other',
+          nameSource: 'generated',
+        },
+      });
+    },
+    [handleCreateProject, t],
+  );
+
+  const handleCreateDesignSystemFromProject = useCallback(
+    async (
+      sourceProjectId: string,
+      input: { name?: string; pendingPrompt?: string },
+    ) => {
+      const result = await createDesignSystemProjectFromProject(sourceProjectId, input);
+      try {
+        window.sessionStorage.setItem(`od:auto-send-first:${result.project.id}`, '1');
+      } catch {
+        // If sessionStorage is unavailable, the project still opens with the
+        // pending prompt ready for the user to send manually.
+      }
+      rememberLocalProject(result.project.id);
+      setProjects((curr) => [
+        result.project,
+        ...curr.filter((p) => p.id !== result.project.id),
+      ]);
+      void refreshDesignSystems();
+      navigate({
+        kind: 'project',
+        projectId: result.project.id,
+        conversationId: result.conversationId,
+        fileName: null,
+      });
+    },
+    [refreshDesignSystems, rememberLocalProject],
+  );
+
+  const handleDuplicateProject = useCallback(
+    async (sourceProjectId: string, input: { name?: string } = {}) => {
+      const result = await duplicateProject(sourceProjectId, input);
+      rememberLocalProject(result.project.id);
+      setProjects((curr) => [
+        result.project,
+        ...curr.filter((p) => p.id !== result.project.id),
+      ]);
+      navigate({
+        kind: 'project',
+        projectId: result.project.id,
+        conversationId: result.conversationId,
+        fileName: null,
+      });
+    },
+    [rememberLocalProject],
   );
 
   const handleCreatePluginShareProject = useCallback(
@@ -1659,16 +1997,17 @@ function AppInner() {
     });
   }, [beginProjectListRequest, rememberLocalProject, reconcileFetchedProjects]);
 
-  const handleOpenProject = useCallback(async (id: string): Promise<boolean> => {
+  const handleOpenProject = useCallback(async (id: string, fileName?: string): Promise<boolean> => {
+    const routeFileName = fileName ?? null;
     if (projectsRef.current.some((project) => project.id === id)) {
-      navigate({ kind: 'project', projectId: id, fileName: null });
+      navigate({ kind: 'project', projectId: id, fileName: routeFileName });
       return true;
     }
     try {
       const project = await getProject(id);
       if (project) {
         setProjects((curr) => [project, ...curr.filter((candidate) => candidate.id !== project.id)]);
-        navigate({ kind: 'project', projectId: id, fileName: null });
+        navigate({ kind: 'project', projectId: id, fileName: routeFileName });
         return true;
       }
       const request = beginProjectListRequest();
@@ -1678,7 +2017,7 @@ function AppInner() {
         ? undefined
         : list.find((candidate) => candidate.id === id);
       if (fetchedProject) {
-        navigate({ kind: 'project', projectId: id, fileName: null });
+        navigate({ kind: 'project', projectId: id, fileName: routeFileName });
         return true;
       }
     } catch {
@@ -1741,9 +2080,18 @@ function AppInner() {
     void patchProject(id, { name: trimmed });
   }, []);
 
+  // The project header back button is an escape hatch back to Home. Avoid
+  // depending on browser history here: tab restores and template-create flows
+  // can leave an in-app history entry that points back to the same project.
   const handleBack = useCallback(() => {
+    const currentProjectId = route.kind === 'project' ? route.projectId : null;
     navigate({ kind: 'home', view: 'home' });
-  }, []);
+    if (currentProjectId && typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        iframeKeepAlivePool.evictProject(currentProjectId, { includeActive: true });
+      }, 0);
+    }
+  }, [iframeKeepAlivePool, route]);
 
   const handleClearPendingPrompt = useCallback(() => {
     const projectId = route.kind === 'project' ? route.projectId : null;
@@ -2031,10 +2379,15 @@ function AppInner() {
   // a fresh template list. The template store is global — if they just
   // saved a template inside a project, returning home should reflect it
   // immediately in the From-template tab without forcing a page reload.
+  // Same rationale for design systems: a brand extraction (or any in-project
+  // design-system creation) registers a `user:<id>` system out of band, so the
+  // Design systems tab must re-fetch to show it — and the brand-ready prompt
+  // relies on the new system being present so it can preselect it.
   useEffect(() => {
     if (route.kind !== 'home') return;
     void refreshTemplates();
-  }, [route.kind, refreshTemplates]);
+    void refreshDesignSystems();
+  }, [route.kind, refreshTemplates, refreshDesignSystems]);
 
   // Existing card grids (DesignsTab, ProjectView), pickers (NewProjectPanel,
   // ChatComposer mention) all look skills up by id without caring whether
@@ -2105,14 +2458,15 @@ function AppInner() {
     appMain = (
       <DesignSystemCreationFlow
         onBack={() => navigate({ kind: 'home', view: 'design-systems' })}
-        onCreated={(projectId, project) => {
+        designSystems={enabledDS}
+        onCreated={(projectId, project, conversationId) => {
           if (project) {
             setProjects((curr) => [
               project,
               ...curr.filter((p) => p.id !== project.id),
             ]);
           }
-          navigate({ kind: 'project', projectId, conversationId: null, fileName: null });
+          navigate({ kind: 'project', projectId, conversationId: conversationId ?? null, fileName: null });
         }}
         onProjectPrepared={(project) => {
           setProjects((curr) => [
@@ -2175,8 +2529,12 @@ function AppInner() {
         onTouchProject={handleTouchProject}
         onProjectChange={handleProjectChange}
         onProjectsRefresh={refreshProjects}
+        onDeleteProject={handleDeleteProject}
         onChangeDefaultDesignSystem={handleChangeDefaultDesignSystem}
         onDesignSystemsRefresh={refreshDesignSystems}
+        onCreateProjectFromDesignSystem={handleCreateProjectFromDesignSystem}
+        onCreateDesignSystemFromProject={handleCreateDesignSystemFromProject}
+        onDuplicateProject={handleDuplicateProject}
       />
     );
   } else {
@@ -2204,6 +2562,11 @@ function AppInner() {
         onApiProtocolChange={handleApiProtocolChange}
         onApiModelChange={handleApiModelChange}
         onConfigPersist={handleConfigPersist}
+        onPersistByokCredential={persistByokCredentialProfileToDaemon}
+        daemonAppConfigReady={daemonAppConfigReady}
+        onSilentUpdatePreferenceChange={handleSilentUpdatePreferenceChange}
+        onSkillsRefresh={refreshSkills}
+        onSkillsChanged={handleSkillsChanged}
         onRefreshAgents={refreshAgents}
         onThemeChange={handleThemeChange}
         skillsLoading={skillsLoading}
@@ -2218,18 +2581,61 @@ function AppInner() {
         onOpenProject={handleOpenProject}
         onOpenLiveArtifact={handleOpenLiveArtifact}
         onDeleteProject={handleDeleteProject}
+        onDuplicateProject={handleDuplicateProject}
         onRenameProject={handleRenameProject}
         onProjectsRefresh={refreshProjectsStrict}
         onChangeDefaultDesignSystem={handleChangeDefaultDesignSystem}
-        onCreateDesignSystem={() => navigate({ kind: 'design-system-create' })}
+        onCreateDesignSystem={() => {
+          setPendingDesignSystemCreateEntry('design_systems_page');
+          navigate({ kind: 'design-system-create' });
+        }}
         onOpenDesignSystem={(id: string) => navigate({ kind: 'design-system-detail', designSystemId: id })}
         onDesignSystemsRefresh={refreshDesignSystems}
         onPersistComposioKey={handleConfigPersistComposioKey}
         onOpenSettings={openSettings}
         onCompleteOnboarding={handleCompleteOnboarding}
+        artifactUpgradeSlot={
+          amrArtifactUpgradeHomeOffer ? (
+            <AmrArtifactUpgradeHomeCard
+              key={amrArtifactUpgradeHomeOffer.sessionKey}
+              profile={amrLoginStatus?.profile ?? null}
+              metricsConsent={config.telemetry?.metrics === true}
+              installationId={config.installationId}
+              onViewArtifact={() => {
+                if (
+                  !amrArtifactUpgradeHomeOffer.projectId
+                  || !amrArtifactUpgradeHomeOffer.conversationId
+                ) {
+                  navigate({ kind: 'home', view: 'projects' });
+                  return;
+                }
+                navigate({
+                  kind: 'project',
+                  projectId: amrArtifactUpgradeHomeOffer.projectId,
+                  conversationId: amrArtifactUpgradeHomeOffer.conversationId,
+                  fileName: amrArtifactUpgradeHomeOffer.fileName,
+                });
+              }}
+              onDismiss={() => {
+                if (amrArtifactUpgradeHomeMock) return;
+                setAmrArtifactUpgradeHomeOffer((current) =>
+                  current?.sessionKey === amrArtifactUpgradeHomeOffer.sessionKey
+                    ? null
+                    : current,
+                );
+              }}
+            />
+          ) : undefined
+        }
       />
     );
   }
+  const legacyByokMigrationErrorView = legacyByokMigrationError
+    ? legacyByokMigrationErrorPresentation(
+        legacyByokMigrationError,
+        t('settings.autosaveError'),
+      )
+    : null;
   return (
     <>
       <div
@@ -2253,6 +2659,28 @@ function AppInner() {
         />
       )}
       <TooltipLayer />
+      <UpdateDialog />
+      <AmrArtifactUpgradeGate
+        homeVisible={route.kind === 'home' && route.view === 'home'}
+        activeProjectId={route.kind === 'project' ? route.projectId : null}
+        activeConversationId={
+          route.kind === 'project' ? route.conversationId ?? null : null
+        }
+        activeFileName={route.kind === 'project' ? route.fileName : null}
+        plan={resolvedAmrPlan}
+        planResolved={
+          amrLoginStatus !== null
+          && (amrLoginStatus.loggedIn === false || resolvedAmrPlan !== null)
+        }
+        profile={amrLoginStatus?.profile ?? null}
+        metricsConsent={config.telemetry?.metrics === true}
+        installationId={config.installationId}
+        onHomeOfferChange={
+          amrArtifactUpgradeHomeMock
+            ? undefined
+            : setAmrArtifactUpgradeHomeOffer
+        }
+      />
       <AnimatePresence>
       {settingsOpen ? (
         <SettingsDialog
@@ -2266,7 +2694,10 @@ function AppInner() {
           initialHighlight={settingsHighlight}
           composioConfigLoading={composioConfigLoading}
           onPersist={handleConfigPersist}
+          onSilentUpdatePreferenceChange={handleSilentUpdatePreferenceChange}
+          onDraftChange={handleSettingsDraftChange}
           onPersistComposioKey={handleConfigPersistComposioKey}
+          onPersistByokCredential={persistByokCredentialProfileToDaemon}
           onClose={() => {
             // Closing the dialog is the canonical "I'm done" gesture
             // now that there is no global Save button. We mark
@@ -2281,11 +2712,11 @@ function AppInner() {
               setConfig(next);
             }
             setSettingsOpen(false);
+            settingsDraftConfigRef.current = null;
             setSettingsHighlight(null);
           }}
           onRefreshAgents={refreshAgents}
           onAmrLoginStatusChange={handleAmrLoginStatusChange}
-          onSkillsRefresh={refreshSkills}
           daemonMediaProviders={daemonMediaProviders}
           daemonMediaProvidersFetchState={daemonMediaProvidersFetchState}
           mediaProvidersNotice={mediaProvidersNotice}
@@ -2315,6 +2746,21 @@ function AppInner() {
           onDismiss={() => setProjectOpenError(null)}
         />
       ) : null}
+      {legacyByokMigrationErrorView ? (
+        <Toast
+          message={legacyByokMigrationErrorView.message}
+          details={legacyByokMigrationErrorView.details}
+          actionLabel={t('settings.title')}
+          onAction={() => {
+            setLegacyByokMigrationError(null);
+            openSettings('execution');
+          }}
+          role="alert"
+          tone="error"
+          ttlMs={0}
+          onDismiss={() => setLegacyByokMigrationError(null)}
+        />
+      ) : null}
       {/* First-run privacy consent banner. It waits for daemon config
           hydration because privacyDecisionAt is daemon-owned and stripped
           from localStorage. It waits for `onboardingCompleted` so first-run
@@ -2331,21 +2777,14 @@ function AppInner() {
           transition={{ type: 'spring', stiffness: 400, damping: 28 }}
         >
         <PrivacyConsentModal
-          onAccept={() => {
-            // Default opt-in: clicking "I get it" enables the same telemetry
-            // surface the previous two-button "Share usage data" path opted
-            // into. The banner footer + PrivacySection give the user a
-            // one-click path to flip everything off later.
+          onShare={() => {
             // The banner owns only the privacy decision; it does not drive
-            // navigation. Onboarding is gated by `onboardingCompleted` on
-            // its own and runs in parallel.
-            const installationId = generateInstallationIdSafe();
-            void handleConfigPersist({
-              ...latestPersistedConfigRef.current,
-              installationId,
-              privacyDecisionAt: Date.now(),
-              telemetry: { metrics: true, content: true },
-            });
+            // navigation. Choosing Share keeps the current anonymous identity
+            // when one already exists and enables the telemetry surface.
+            handlePrivacyConsentChoice(true);
+          }}
+          onDecline={() => {
+            handlePrivacyConsentChoice(false);
           }}
         />
       </motion.div>

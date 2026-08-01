@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { forwardRef, useImperativeHandle } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { SkillSummary } from '@open-design/contracts';
 import { ChatPane, buildRunErrorDiagnosticText, retryableAssistantMessage } from '../../src/components/ChatPane';
 import { DESIGN_SYSTEM_WORKSPACE_PROMPT_PREFIX } from '../../src/design-system-auto-prompt';
 import { readExpandedIndexCss } from '../helpers/read-expanded-css';
@@ -36,13 +37,35 @@ const translations: Record<string, string> = {
   'chat.copyDone': 'Copied!',
 };
 
+function translate(key: string, vars?: Record<string, unknown>): string {
+  if (key === 'brand.appliedToChat') return `Using ${String(vars?.name ?? '')}`;
+  return translations[key] ?? key;
+}
+
+function skillSummary(id: string): SkillSummary {
+  return {
+    id,
+    name: id,
+    description: `${id} test skill`,
+    triggers: [],
+    mode: 'prototype',
+    previewType: 'html',
+    designSystemRequired: false,
+    defaultFor: [],
+    upstream: null,
+    hasBody: true,
+    examplePrompt: '',
+    aggregatesExamples: false,
+  };
+}
+
 vi.mock('../../src/i18n', () => ({
   useI18n: () => ({
     locale: 'en',
     setLocale: () => undefined,
-    t: (key: string) => translations[key] ?? key,
+    t: translate,
   }),
-  useT: () => (key: string) => translations[key] ?? key,
+  useT: () => translate,
 }));
 
 vi.mock('../../src/components/AssistantMessage', () => ({
@@ -54,6 +77,7 @@ vi.mock('../../src/components/AssistantMessage', () => ({
     shareToOpenDesignBusy,
     showConversationTodoCard,
     conversationTodoInput,
+    showRole,
   }: {
     streaming: boolean;
     message: ChatMessage;
@@ -65,8 +89,10 @@ vi.mock('../../src/components/AssistantMessage', () => ({
       todos?: Array<{ content: string; status?: string }>;
       plan?: Array<{ content?: string; step?: string; status?: string }>;
     } | null;
+    showRole?: boolean;
   }) => (
     <>
+      <output data-testid={`assistant-role-${message.id}`}>{showRole === false ? 'continued' : 'shown'}</output>
       <output data-testid={`assistant-streaming-${message.id}`}>{streaming ? 'streaming' : 'idle'}</output>
       <output data-testid={`assistant-last-${message.id}`}>{isLast ? 'last' : 'not-last'}</output>
       {showConversationTodoCard && conversationTodoInput ? (
@@ -190,6 +216,7 @@ function mockDataTransfer(): DataTransfer {
 }
 
 beforeEach(() => {
+  sessionStorage.clear();
   MockResizeObserver.instances = [];
   vi.stubGlobal('ResizeObserver', MockResizeObserver);
   vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
@@ -314,6 +341,26 @@ describe('ChatPane streaming state', () => {
       .toBeNull();
   });
 
+  it.each(['no_result', 'delivery_failed'] as const)(
+    'exposes retry for a %s delivery failure',
+    (resultDeliveryState) => {
+      const deliveryFailure: ChatMessage = {
+        id: `assistant-${resultDeliveryState}`,
+        role: 'assistant',
+        content: 'The design result was not delivered.',
+        createdAt: 1,
+        runStatus: 'succeeded',
+        resultDeliveryState,
+      };
+      const messages: ChatMessage[] = [
+        { id: 'user-1', role: 'user', content: 'Create a login page', createdAt: 0 },
+        deliveryFailure,
+      ];
+
+      expect(retryableAssistantMessage(messages, deliveryFailure.id, false)).toBe(deliveryFailure);
+    },
+  );
+
   it('copies failed-run diagnostics with the trace id from the error card', async () => {
     const messages: ChatMessage[] = [
       { id: 'user-1', role: 'user', content: 'Create a login page', createdAt: 0 },
@@ -352,9 +399,10 @@ describe('ChatPane streaming state', () => {
         onSelectConversation={vi.fn()}
         onDeleteConversation={vi.fn()}
         projectMetadata={projectMetadata}
-      />,
+    />,
     );
 
+    fireEvent.click(screen.getByRole('button', { name: 'brand.viewDetails' }));
     fireEvent.click(screen.getByRole('button', { name: 'Copy error diagnostics' }));
 
     await waitFor(() => expect(clipboardMocks.copyToClipboard).toHaveBeenCalledTimes(1));
@@ -364,11 +412,13 @@ describe('ChatPane streaming state', () => {
     expect(copied).toContain('error_code: AGENT_EXECUTION_FAILED');
     expect(copied).toContain('project_id: project-1');
     expect(copied).toContain('conversation_id: conv-1');
-    expect(copied).toContain('json-rpc id 4: Connection reset by server');
+    expect(copied).toMatch(/^json-rpc id 4: Connection reset by server\n\nOpen Design run error diagnostics/);
+    expect(copied).not.toContain('raw_error:');
+    expect(copied).not.toContain('\nerror:\n');
   });
 
   it('formats run error diagnostics with a raw error when guidance copy differs', () => {
-    expect(buildRunErrorDiagnosticText({
+    const text = buildRunErrorDiagnosticText({
       message: 'Service unavailable. Try again.',
       rawMessage: 'json-rpc id 4: Connection reset by server',
       errorCode: 'UPSTREAM_UNAVAILABLE',
@@ -377,7 +427,30 @@ describe('ChatPane streaming state', () => {
       conversationId: 'conv-1',
       assistantMessageId: 'assistant-1',
       agentId: 'amr',
-    })).toContain('raw_error:\njson-rpc id 4: Connection reset by server');
+    });
+
+    expect(text).toMatch(/^json-rpc id 4: Connection reset by server\n\nOpen Design run error diagnostics/);
+    expect(text).not.toContain('raw_error:');
+    expect(text).toContain('error_code: UPSTREAM_UNAVAILABLE');
+    expect(text).not.toContain('\nerror:\n');
+  });
+
+  it('falls back to the display message when raw error text is unavailable', () => {
+    const text = buildRunErrorDiagnosticText({
+      message: 'Connection dropped. Try again.',
+      rawMessage: '  ',
+      errorCode: 'AGENT_CONNECTION_DROPPED',
+      traceId: 'run-abc',
+      projectId: 'project-1',
+      conversationId: 'conv-1',
+      assistantMessageId: 'assistant-1',
+      agentId: 'amr',
+    });
+
+    expect(text).toMatch(/^Connection dropped\. Try again\.\n\nOpen Design run error diagnostics/);
+    expect(text).not.toContain('raw_error:');
+    expect(text).toContain('error_code: AGENT_CONNECTION_DROPPED');
+    expect(text).not.toContain('\nerror:\n');
   });
 
   it('renders user turns with the chat bubble styling hook', () => {
@@ -474,6 +547,7 @@ describe('ChatPane streaming state', () => {
         createdAt: 1,
         sessionMode: 'design',
         runContext: {
+          skillIds: ['visual-explain'],
           workspaceItems: [
             {
               id: 'browser:tab-1',
@@ -544,25 +618,113 @@ describe('ChatPane streaming state', () => {
         onRequestPluginDetails={onRequestPluginDetails}
         onRequestDesignSystemDetails={onRequestDesignSystemDetails}
         activeDesignSystem={activeDesignSystem}
+        skills={[skillSummary('visual-explain')]}
       />,
     );
 
     expect(screen.getByTestId('msg-session-mode-chip').textContent).toContain('Design Agent');
     expect(screen.getByTestId('msg-workspace-context-chip').textContent).toContain('Dribbble');
-    expect(screen.getByTestId('msg-plugin-chip').textContent)
-      .toContain('A Decade of Refinement Glow-Up');
+    const context = screen.getByTestId('msg-applied-context');
+    expect(context.textContent).toContain('A Decade of Refinement Glow-Up');
+    expect(context.textContent).toContain('visual-explain');
+    expect(context.textContent).toContain('Neutral Modern');
     fireEvent.click(screen.getByTestId('msg-workspace-context-chip'));
     expect(onRequestOpenFile).toHaveBeenCalledWith('tab-1');
-    fireEvent.click(screen.getByTestId('msg-plugin-chip'));
+    fireEvent.click(within(context).getByRole('button', { name: /Using/ }));
+    fireEvent.click(within(context).getByRole('button', { name: /Plugin.*A Decade of Refinement Glow-Up/ }));
     expect(onRequestPluginDetails).toHaveBeenCalledWith('refinement-plugin');
-    expect(screen.getByTestId('msg-design-system-chip').textContent).toContain('Neutral Modern');
-    fireEvent.click(screen.getByTestId('msg-design-system-chip'));
+    fireEvent.click(within(context).getByRole('button', { name: /Design System.*Neutral Modern/ }));
     expect(onRequestDesignSystemDetails).toHaveBeenCalledWith(activeDesignSystem);
     // The plugin's resolved context is now collapsed into the single
     // plugin chip — the per-category (asset/design/skill) fan-out is no
     // longer rendered in the bubble, even though the full snapshot still
     // rides the run for the agent.
     expect(screen.queryByText('template.json')).toBeNull();
+  });
+
+  it('shows one identity header for consecutive replies from the same assistant', () => {
+    const messages: ChatMessage[] = [
+      { id: 'assistant-1', role: 'assistant', content: 'First stage', createdAt: 1, agentId: 'claude' },
+      { id: 'assistant-2', role: 'assistant', content: 'Second stage', createdAt: 2, agentId: 'claude' },
+      { id: 'assistant-3', role: 'assistant', content: 'Different assistant', createdAt: 3, agentId: 'codex' },
+      { id: 'user-1', role: 'user', content: 'Continue', createdAt: 4 },
+      { id: 'assistant-4', role: 'assistant', content: 'After user turn', createdAt: 5, agentId: 'codex' },
+    ] as ChatMessage[];
+
+    render(
+      <ChatPane
+        projectKindForTracking="prototype"
+        messages={messages}
+        streaming={false}
+        error={null}
+        projectId="project-1"
+        projectFiles={[]}
+        onEnsureProject={async () => 'project-1'}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        conversations={conversations}
+        activeConversationId="conv-1"
+        onSelectConversation={vi.fn()}
+        onDeleteConversation={vi.fn()}
+        projectMetadata={projectMetadata}
+      />,
+    );
+
+    expect(screen.getByTestId('assistant-role-assistant-1').textContent).toBe('shown');
+    expect(screen.getByTestId('assistant-role-assistant-2').textContent).toBe('continued');
+    expect(screen.getByTestId('assistant-role-assistant-3').textContent).toBe('shown');
+    expect(screen.getByTestId('assistant-role-assistant-4').textContent).toBe('shown');
+  });
+
+  it('shows applied context again only when the configuration changes', () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'user-1',
+        role: 'user',
+        content: 'First request',
+        createdAt: 1,
+        runContext: { skillIds: ['visual-explain'] },
+      },
+      {
+        id: 'user-2',
+        role: 'user',
+        content: 'Same setup',
+        createdAt: 2,
+        runContext: { skillIds: ['visual-explain'] },
+      },
+      {
+        id: 'user-3',
+        role: 'user',
+        content: 'Changed setup',
+        createdAt: 3,
+        runContext: { skillIds: ['imagegen'] },
+      },
+    ];
+
+    render(
+      <ChatPane
+        projectKindForTracking="prototype"
+        messages={messages}
+        streaming={false}
+        error={null}
+        projectId="project-1"
+        projectFiles={[]}
+        onEnsureProject={async () => 'project-1'}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        conversations={conversations}
+        activeConversationId="conv-1"
+        onSelectConversation={vi.fn()}
+        onDeleteConversation={vi.fn()}
+        projectMetadata={projectMetadata}
+        skills={[skillSummary('visual-explain'), skillSummary('imagegen')]}
+      />,
+    );
+
+    const contexts = screen.getAllByTestId('msg-applied-context');
+    expect(contexts).toHaveLength(2);
+    expect(contexts[0]?.textContent).toContain('visual-explain');
+    expect(contexts[1]?.textContent).toContain('imagegen');
   });
 
   it('hides internal path ids from comment attachment chips', () => {
@@ -786,7 +948,8 @@ Expected output:
     expect(spacer!.style.height).toBe('0px');
   });
 
-  it('passes a stopped inline todo after a terminal run without a final TodoWrite', () => {
+  it('pins a stopped todo after a terminal run without a final TodoWrite', () => {
+    const onContinueRemainingTasks = vi.fn();
     const messages: ChatMessage[] = [
       {
         id: 'assistant-1',
@@ -831,14 +994,178 @@ Expected output:
         onSelectConversation={vi.fn()}
         onDeleteConversation={vi.fn()}
         projectMetadata={projectMetadata}
+        onContinueRemainingTasks={onContinueRemainingTasks}
       />,
     );
 
-    expect(container.querySelectorAll('.chat-log .op-card.op-todo')).toHaveLength(1);
+    expect(container.querySelector('.chat-log .op-card.op-todo')).toBeNull();
+    expect(container.querySelectorAll('.chat-pinned-todo .op-card.op-todo')).toHaveLength(1);
     expect(container.querySelector('.todo-stopped .todo-text')?.textContent).toBe('Build prototype');
     expect(container.querySelector('.todo-pending .todo-text')?.textContent).toBe('Run QA');
-    expect(container.querySelector('.chat-pinned-todo')).toBeNull();
+    const continueButton = container.querySelector<HTMLButtonElement>('.op-todo-continue');
+    expect(continueButton).not.toBeNull();
+    fireEvent.click(continueButton!);
+    expect(onContinueRemainingTasks).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'assistant-1' }),
+      [
+        {
+          content: 'Build prototype',
+          status: 'in_progress',
+          activeForm: 'Building prototype',
+        },
+        { content: 'Run QA', status: 'pending', activeForm: undefined },
+      ],
+    );
   });
+
+  it('hides the stale pinned todo after continuing its remaining tasks', async () => {
+    const onContinueRemainingTasks = vi.fn(() => true);
+    const messages: ChatMessage[] = [
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: '',
+        createdAt: 1,
+        endedAt: 2,
+        runStatus: 'failed',
+        events: [
+          {
+            kind: 'tool_use',
+            id: 'todo-1',
+            name: 'TodoWrite',
+            input: {
+              todos: [
+                { content: 'Build prototype', status: 'completed' },
+                { content: 'Run QA', status: 'pending' },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    const { container, rerender } = render(
+      <ChatPane
+        messages={messages}
+        streaming={false}
+        error={null}
+        projectId="project-1"
+        projectFiles={[]}
+        onEnsureProject={async () => 'project-1'}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        conversations={conversations}
+        activeConversationId="conv-1"
+        onSelectConversation={vi.fn()}
+        onDeleteConversation={vi.fn()}
+        projectMetadata={projectMetadata}
+        onContinueRemainingTasks={onContinueRemainingTasks}
+      />,
+    );
+
+    fireEvent.click(container.querySelector<HTMLButtonElement>('.op-todo-continue')!);
+
+    expect(onContinueRemainingTasks).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(container.querySelector('.chat-pinned-todo')).toBeNull();
+    });
+
+    rerender(
+      <ChatPane
+        messages={[
+          ...messages,
+          {
+            id: 'assistant-2',
+            role: 'assistant',
+            content: '',
+            createdAt: 3,
+            runStatus: 'running',
+            events: [
+              {
+                kind: 'tool_use',
+                id: 'todo-2',
+                name: 'TodoWrite',
+                input: {
+                  todos: [
+                    { content: 'Build prototype', status: 'completed' },
+                    { content: 'Run QA', status: 'pending' },
+                  ],
+                },
+              },
+            ],
+          },
+        ]}
+        streaming
+        error={null}
+        projectId="project-1"
+        projectFiles={[]}
+        onEnsureProject={async () => 'project-1'}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        conversations={conversations}
+        activeConversationId="conv-1"
+        onSelectConversation={vi.fn()}
+        onDeleteConversation={vi.fn()}
+        projectMetadata={projectMetadata}
+        onContinueRemainingTasks={onContinueRemainingTasks}
+      />,
+    );
+
+    expect(container.querySelector('.chat-pinned-todo')).not.toBeNull();
+  });
+
+  it('keeps a continued todo snapshot hidden after the conversation remounts', async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: '',
+        createdAt: 1,
+        endedAt: 2,
+        runStatus: 'failed',
+        events: [
+          {
+            kind: 'tool_use',
+            id: 'todo-1',
+            name: 'update_plan',
+            input: {
+              plan: [
+                { step: 'Build prototype', status: 'completed' },
+                { step: 'Run QA', status: 'pending' },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+    const props = {
+      messages,
+      streaming: false,
+      error: null,
+      projectId: 'project-1',
+      projectFiles: [],
+      onEnsureProject: async () => 'project-1',
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      conversations,
+      activeConversationId: 'conv-1',
+      onSelectConversation: vi.fn(),
+      onDeleteConversation: vi.fn(),
+      projectMetadata,
+      onContinueRemainingTasks: vi.fn(() => true),
+    };
+
+    const firstMount = render(<ChatPane {...props} />);
+    fireEvent.click(firstMount.container.querySelector<HTMLButtonElement>('.op-todo-continue')!);
+    await waitFor(() => {
+      expect(firstMount.container.querySelector('.chat-pinned-todo')).toBeNull();
+    });
+    firstMount.unmount();
+
+    const secondMount = render(<ChatPane {...props} />);
+    expect(secondMount.container.querySelector('.chat-pinned-todo')).toBeNull();
+  });
+
   it('shows several queued prompts above the composer with compact controls', () => {
     const onRemoveQueuedSend = vi.fn();
     const onSendQueuedNow = vi.fn();

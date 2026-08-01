@@ -2,6 +2,11 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import type { ToolPackConfig } from "../config.js";
+import { domToPptxBundleResource } from "../dom-to-pptx-resource.js";
+import {
+  assertNodePtyRuntime,
+  resolveNodePtyRuntimeArch,
+} from "../node-pty-runtime.js";
 import { macResources } from "../resources.js";
 import { electronBuilderVersionForAppVersion } from "../versions.js";
 import { execFileAsync } from "./commands.js";
@@ -115,6 +120,9 @@ export async function runElectronBuilder(
     extraResources: [
       { from: paths.resourceRoot, to: "open-design" },
       { from: paths.packagedConfigPath, to: "open-design-config.json" },
+      // Vendored dom-to-pptx browser bundle for editable PPTX export. The desktop
+      // main reads it from process.resourcesPath at runtime.
+      domToPptxBundleResource(config),
     ],
     files: [...ELECTRON_BUILDER_FILE_PATTERNS],
     mac: {
@@ -160,5 +168,10 @@ export async function runElectronBuilder(
       ...(config.signed ? {} : { CSC_IDENTITY_AUTO_DISCOVERY: "false" }),
       ...(webStandaloneHookConfigPath == null ? {} : { [WEB_STANDALONE_HOOK_CONFIG_ENV]: webStandaloneHookConfigPath }),
     },
+  });
+  await assertNodePtyRuntime({
+    appRoot: join(paths.appPath, "Contents", "Resources", "app"),
+    arch: resolveNodePtyRuntimeArch(process.arch),
+    platform: "darwin",
   });
 }

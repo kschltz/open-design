@@ -8,6 +8,9 @@ import type {
   AgentTestRequest,
   AppVersionInfo,
   AppVersionResponse,
+  WhatsNewContent,
+  WhatsNewLocaleContent,
+  WhatsNewResponse,
   AudioKind,
   ChatAttachment,
   ChatCommentAttachment,
@@ -105,7 +108,15 @@ export type {
 } from '@open-design/contracts';
 
 export type ExecMode = 'daemon' | 'api';
-export type ApiProtocol = 'anthropic' | 'openai' | 'azure' | 'google' | 'ollama' | 'senseaudio' | 'aihubmix';
+export type ApiProtocol =
+  | 'anthropic'
+  | 'openai'
+  | 'azure'
+  | 'google'
+  | 'ollama'
+  | 'senseaudio'
+  | 'aihubmix'
+  | 'bedrock';
 
 export type LiveArtifactTabId = `live:${string}`;
 // Tab ids are arbitrary strings; the template-literal members below are
@@ -256,6 +267,11 @@ export interface ApiProtocolConfig {
   byokSpeechVoice?: string;
 }
 
+export interface ByokProviderConfigDraft {
+  apiConfig: ApiProtocolConfig;
+  maxTokens?: number;
+}
+
 // Per-CLI model + reasoning the user picked in the model menu. Each agent
 // keeps its own slot so flipping between Codex and Gemini doesn't reset the
 // other one's choice. Missing entries fall back to the agent's first
@@ -365,6 +381,10 @@ export interface PetConfig {
 export interface AppConfig {
   mode: ExecMode;
   apiKey: string;
+  /** Non-secret daemon-owned credential profile selected for BYOK runs. */
+  byokProfileId?: string;
+  byokCredentialConfigured?: boolean;
+  byokCredentialTail?: string;
   baseUrl: string;
   model: string;
   apiProtocol?: ApiProtocol;
@@ -381,6 +401,10 @@ export interface AppConfig {
   byokSpeechModel?: string;
   byokSpeechVoice?: string;
   apiProtocolConfigs?: Partial<Record<ApiProtocol, ApiProtocolConfig>>;
+  /** BYOK provider drafts keyed by protocol + selected provider base URL. */
+  byokProviderConfigDrafts?: Record<string, ByokProviderConfigDraft>;
+  /** Provider draft restored first when Settings returns to BYOK. */
+  byokPendingProviderKey?: string;
   /** Internal config schema/migration version for localStorage upgrades. */
   configMigrationVersion?: number;
   /** Base URL of the selected known provider; cleared once the user customizes provider fields. */
@@ -431,6 +455,7 @@ export interface AppConfig {
   // resolved. This is independent from installationId so Delete my data can
   // rotate or clear the anonymous id without re-opening the consent banner.
   privacyDecisionAt?: number | null;
+  allowSilentUpdates?: boolean;
   // Privacy preferences governing what (if anything) is shipped to the
   // PostHog / Langfuse telemetry endpoints. `metrics` and `content`
   // default ON (set by `DEFAULT_CONFIG.telemetry` in state/config.ts) so
@@ -503,9 +528,25 @@ export interface ExamplePreview {
   html: string;
 }
 
+export type ModelCost = 'low' | 'medium' | 'high' | 'very_high';
+
+export type ModelCapability = 'standard' | 'advanced' | 'best_quality';
+
+export interface ModelMetadata {
+  cost?: ModelCost;
+  capability?: ModelCapability;
+}
+
 export interface AgentModelOption {
   id: string;
   label: string;
+  enabled?: boolean;
+  default?: boolean;
+  inputPriceUsdPerMillion?: number;
+  outputPriceUsdPerMillion?: number;
+  metadata?: ModelMetadata;
+  additionalSpeedTiers?: string[];
+  serviceTierOptions?: AgentModelOption[];
 }
 
 export type Surface = 'web' | 'image' | 'video' | 'audio';
@@ -542,6 +583,9 @@ export type {
   AgentTestRequest,
   AppVersionInfo,
   AppVersionResponse,
+  WhatsNewContent,
+  WhatsNewLocaleContent,
+  WhatsNewResponse,
   AudioKind,
   ConnectionTestKind,
   ConnectionTestProtocol,

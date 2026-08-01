@@ -4,7 +4,8 @@
   "name": "discovery-question-form",
   "title": "Discovery question form",
   "version": "0.1.0",
-  "description": "Turn-1 discovery question form for ambiguous briefs.",
+  "publishedAt": "2026-05-09T13:00:27Z",
+  "description": "Structured clarification form for unresolved material requirements.",
   "license": "MIT",
   "author": {
     "name": "Open Design",

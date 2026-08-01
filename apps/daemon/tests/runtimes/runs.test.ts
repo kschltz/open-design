@@ -9,6 +9,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createChatRunService } from '../../src/runtimes/runs.js';
 
 describe('chat run service shutdown', () => {
+  it('publishes the authoritative artifact count in status and terminal events', async () => {
+    const runs = createRuns();
+    const run = runs.create({ projectId: 'project-1', conversationId: 'conv-1' });
+
+    run.artifactCount = 2;
+    const wait = runs.wait(run);
+    runs.finish(run, 'succeeded', 0, null);
+
+    expect(runs.statusBody(run)).toMatchObject({ status: 'succeeded', artifactCount: 2 });
+    expect(run.events.at(-1)).toMatchObject({
+      event: 'end',
+      data: { status: 'succeeded', artifactCount: 2 },
+    });
+    await expect(wait).resolves.toMatchObject({ status: 'succeeded', artifactCount: 2 });
+  });
+
   it('retains structured error details on failed run status bodies', async () => {
     const runs = createRuns();
     const run = runs.create({ projectId: 'project-1', conversationId: 'conv-1' });
@@ -33,6 +49,93 @@ describe('chat run service shutdown', () => {
       status: 'failed',
       errorCode: 'AGENT_EXECUTION_FAILED',
       error: 'Agent stalled without emitting any new output for 1s.',
+    });
+  });
+
+  it('reopens the same logical run for an explicit recharge recovery attempt', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-27T00:00:00.000Z'));
+    const runs = createRuns();
+    const run = runs.create({
+      projectId: 'project-1',
+      conversationId: 'conv-1',
+      clientRequestId: 'brief-1-cloud',
+      requestFingerprint: 'same-logical-request',
+      agentId: 'amr',
+    });
+    (run as any).failureAction = 'recharge';
+    runs.emit(run, 'error', {
+      error: {
+        code: 'AMR_INSUFFICIENT_BALANCE',
+        message: 'insufficient balance',
+        retryable: false,
+      },
+    });
+    runs.finish(run, 'failed', 1, null);
+    vi.advanceTimersByTime(12_345);
+
+    const resumed = runs.prepareRestart(run);
+
+    expect(resumed).toBe(run);
+    expect(runs.get(run.id)).toBe(run);
+    expect(runs.statusBody(run)).toMatchObject({
+      id: run.id,
+      clientRequestId: 'brief-1-cloud',
+      status: 'queued',
+      error: null,
+      errorCode: null,
+      failureAction: null,
+    });
+    expect(run.manualResumeAttemptCount).toBe(1);
+    expect(run.rechargeWaitDurationMs).toBe(12_345);
+    expect(run.events.at(-1)).toMatchObject({
+      event: 'run_resume_attempted',
+      data: {
+        runId: run.id,
+        attempt: 1,
+        reason: 'recharge',
+        rechargeWaitDurationMs: 12_345,
+      },
+    });
+    vi.useRealTimers();
+  });
+
+  it('keeps the first accepted plugin attribution immutable across request reuse', () => {
+    const runs = createRuns();
+    const request = {
+      projectId: 'project-1',
+      conversationId: 'conv-1',
+      clientRequestId: 'logical-request-1',
+      requestFingerprint: 'same-logical-request',
+      agentId: 'amr',
+      analyticsHints: {
+        entrySurface: 'external_mcp',
+        hostProduct: 'codex_cli',
+        externalPluginId: 'open-design',
+        externalPluginVersion: '0.4.0',
+        distributionMechanism: 'git_marketplace',
+        publisherClass: 'open_design_first_party',
+        attributionQuality: 'session_correlated',
+        pluginWorkflowId: '018f6f2e-4444-7444-8444-444444444444',
+        logicalRequestDigest: 'a'.repeat(64),
+        logicalRequestDigestVersion: 1,
+        generationSloWindowMs: 45 * 60 * 1000,
+      },
+    };
+    const created = runs.createOrReuse(request);
+    expect(created.kind).toBe('created');
+    const retried = runs.createOrReuse({
+      ...request,
+      analyticsHints: {
+        ...request.analyticsHints,
+        externalPluginVersion: '9.9.9',
+        pluginWorkflowId: '018f6f2e-9999-7999-8999-999999999999',
+      },
+    });
+    expect(retried.kind).toBe('reused');
+    expect(retried.run.externalPluginAnalytics).toMatchObject({
+      externalPluginVersion: '0.4.0',
+      pluginWorkflowId: '018f6f2e-4444-7444-8444-444444444444',
     });
   });
 
@@ -63,6 +166,22 @@ describe('chat run service shutdown', () => {
       runs.list({ projectId: 'project-1', conversationId: 'conv-b', status: 'active' }),
     ).toEqual([runB]);
   });
+
+  it('normalizes session mode and run context metadata at creation', () => {
+    const runs = createRuns();
+    const workspaceContext = {
+      workspaceItems: [{ id: 'active-file:index.html', label: 'index.html', kind: 'file' }],
+    };
+
+    const valid = runs.create({ sessionMode: 'plan', context: workspaceContext });
+    expect(valid.sessionMode).toBe('plan');
+    expect(valid.context).toEqual(workspaceContext);
+
+    const invalid = runs.create({ sessionMode: 'review', context: [] });
+    expect(invalid.sessionMode).toBeNull();
+    expect(invalid.context).toBeNull();
+  });
+
   it('cancels a queued run immediately without waiting for child process shutdown', async () => {
     const runs = createRuns();
     const run = runs.create({ projectId: 'project-1', conversationId: 'conv-queued' });
@@ -258,6 +377,39 @@ describe('chat run service shutdown', () => {
     });
   });
 
+  it('stores native session recovery metadata on run status bodies', () => {
+    const runs = createRuns();
+    const run = runs.create({ projectId: 'project-1', conversationId: 'conv-a' });
+    (run as any).nativeSessionRecovery = {
+      agentId: 'codex',
+      state: 'captured_not_resumed',
+      acquisition: 'stream-captured',
+      continuation: 'native-resume-by-id',
+      handle: {
+        present: true,
+        kind: 'cli-thread-id',
+        display: null,
+        sha256: 'a'.repeat(64),
+        redacted: true,
+      },
+      guardReason: null,
+      fallbackReason: null,
+      updatedAt: 123,
+    };
+
+    expect(runs.statusBody(run)).toMatchObject({
+      nativeSessionRecovery: {
+        agentId: 'codex',
+        state: 'captured_not_resumed',
+        handle: {
+          display: null,
+          sha256: 'a'.repeat(64),
+          redacted: true,
+        },
+      },
+    });
+  });
+
   it('summarizes OD-owned project storage on run status bodies', () => {
     const runs = createRuns();
     const run = runs.create({ projectId: 'project-1', conversationId: 'conv-a' });
@@ -286,6 +438,39 @@ describe('chat run service shutdown', () => {
       storage: {
         kind: 'folder-backed',
         baseDir: '/Users/alice/site',
+      },
+      provenance: {
+        kind: 'user-local',
+        writeback: 'in-place',
+      },
+    });
+  });
+
+  it('recomputes workspace from updated project metadata on status bodies', () => {
+    const runs = createRuns();
+    const run = runs.create({
+      projectId: 'routine-pending-project',
+      conversationId: 'routine-pending-conversation',
+    });
+
+    expect(runs.statusBody(run).workspace).toEqual({
+      storage: {
+        kind: 'od-owned',
+        baseDir: null,
+      },
+      provenance: null,
+    });
+
+    run.projectId = 'real-project';
+    run.projectMetadata = {
+      importedFrom: 'folder',
+      baseDir: '/Users/alice/reused-project',
+    };
+
+    expect(runs.statusBody(run).workspace).toEqual({
+      storage: {
+        kind: 'folder-backed',
+        baseDir: '/Users/alice/reused-project',
       },
       provenance: {
         kind: 'user-local',
@@ -638,6 +823,188 @@ describe('run event log persistence', () => {
     expect(parsed[0]).toMatchObject({ event: 'agent', data: { type: 'text_delta', delta: 'hello' } });
     expect(parsed[1]).toMatchObject({ event: 'agent', data: { type: 'text_delta', delta: ' world' } });
     expect(parsed[2]).toMatchObject({ event: 'end', data: { status: 'succeeded' } });
+  });
+
+  it('persists a restart-safe terminal state and telemetry checkpoints', () => {
+    const runs = createRunsWithLog(tmpDir);
+    const run = runs.create({
+      projectId: 'p1',
+      conversationId: 'c1',
+      assistantMessageId: 'm1',
+      agentId: 'claude',
+    });
+    const statePath = path.join(tmpDir, run.id, 'state.json');
+
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toMatchObject({
+      schemaVersion: 1,
+      id: run.id,
+      status: 'queued',
+      assistantMessageId: 'm1',
+    });
+
+    runs.setAnalyticsRecovery(run, {
+      context: {
+        deviceId: 'device-1',
+        sessionId: 'session-1',
+        clientType: 'desktop',
+        locale: 'zh-CN',
+      },
+      properties: {
+        page_name: 'chat_panel',
+        area: 'chat_panel',
+        project_id: 'p1',
+        conversation_id: 'c1',
+        run_id: run.id,
+      },
+      insertId: 'run-created-1',
+    });
+    run.status = 'running';
+    runs.emit(run, 'start', { status: 'running' });
+    runs.finish(run, 'failed', 1, null);
+    runs.markAnalyticsCompleted(run);
+    runs.markLangfuseCompleted(run);
+
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toMatchObject({
+      status: 'failed',
+      exitCode: 1,
+      analyticsRecovery: {
+        insertId: 'run-created-1',
+        completedAt: expect.any(Number),
+      },
+      langfuseCompletedAt: expect.any(Number),
+    });
+  });
+
+  it('restores the accepted plugin workflow binding from durable run state', () => {
+    const pluginWorkflowId = '018f6f2e-4444-7444-8444-444444444444';
+    const runs = createRunsWithLog(tmpDir);
+    const run = runs.create({
+      projectId: 'p1',
+      conversationId: 'c1',
+      clientRequestId: '018f6f2e-5555-7555-8555-555555555555',
+      requestFingerprint: 'same-logical-request',
+      agentId: 'amr',
+      analyticsHints: {
+        entrySurface: 'external_mcp',
+        hostProduct: 'codex_unknown',
+        externalPluginId: 'open-design',
+        externalPluginVersion: '0.4.0',
+        distributionMechanism: 'git_marketplace',
+        publisherClass: 'open_design_first_party',
+        attributionQuality: 'session_correlated',
+        pluginWorkflowId,
+        logicalRequestDigest: 'a'.repeat(64),
+        logicalRequestDigestVersion: 1,
+        generationSloWindowMs: 45 * 60 * 1000,
+      },
+    });
+    runs.finish(run, 'succeeded', 0, null);
+
+    const restarted = createRunsWithLog(tmpDir);
+    expect(restarted.findByPluginWorkflowId(pluginWorkflowId)).toMatchObject({
+      id: run.id,
+      projectId: 'p1',
+      externalPluginAnalytics: {
+        externalPluginId: 'open-design',
+        pluginWorkflowId,
+        logicalRequestDigest: 'a'.repeat(64),
+      },
+    });
+  });
+
+  it('reuses an interrupted durable request instead of starting it twice after restart', () => {
+    const clientRequestId = '018f6f2e-6666-7666-8666-666666666666';
+    const requestFingerprint = 'same-cloud-request';
+    const beforeRestart = createRunsWithLog(tmpDir);
+    const original = beforeRestart.create({
+      agentId: 'amr',
+      clientRequestId,
+      projectId: 'p1',
+      requestFingerprint,
+    });
+    const statePath = path.join(tmpDir, original.id, 'state.json');
+    const runningState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    fs.writeFileSync(
+      statePath,
+      `${JSON.stringify({ ...runningState, status: 'running' })}\n`,
+      'utf8',
+    );
+
+    const afterRestart = createRunsWithLog(tmpDir);
+    const reused = afterRestart.createOrReuse({
+      agentId: 'amr',
+      clientRequestId,
+      projectId: 'p1',
+      requestFingerprint,
+    });
+
+    expect(reused.kind).toBe('reused');
+    expect(reused.run).toMatchObject({
+      id: original.id,
+      status: 'failed',
+      errorCode: 'DAEMON_RESTARTED',
+      error: 'Run interrupted because the daemon restarted.',
+    });
+    expect(reused.run.events.slice(-2)).toMatchObject([
+      { event: 'error', data: { error: { code: 'DAEMON_RESTARTED' } } },
+      { event: 'end', data: { status: 'failed' } },
+    ]);
+    expect(fs.readdirSync(tmpDir)).toEqual([original.id]);
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toMatchObject({
+      id: original.id,
+      status: 'failed',
+      errorCode: 'DAEMON_RESTARTED',
+      terminalRecoveryReason: 'daemon_restart',
+    });
+  });
+
+  it('persists native session recovery diagnostics in the run event log', async () => {
+    const runs = createRunsWithLog(tmpDir);
+    const run = runs.create({ projectId: 'p1' });
+
+    runs.emit(run, 'diagnostic', {
+      type: 'native_session_recovery',
+      nativeSessionRecovery: {
+        agentId: 'amr',
+        state: 'resumed',
+        acquisition: 'acp-session-load',
+        continuation: 'acp-session-load',
+        handle: {
+          present: true,
+          kind: 'acp-session-handle',
+          display: null,
+          sha256: 'b'.repeat(64),
+          redacted: true,
+        },
+        guardReason: null,
+        fallbackReason: null,
+        updatedAt: 456,
+      },
+    });
+    runs.finish(run, 'succeeded', 0, null);
+
+    const logPath = path.join(tmpDir, run.id, 'events.jsonl');
+    let text = '';
+    for (let i = 0; i < 50; i++) {
+      if (fs.existsSync(logPath)) {
+        text = fs.readFileSync(logPath, 'utf8');
+        if (text.includes('native_session_recovery')) break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const parsed = text.trim().split('\n').map((line) => JSON.parse(line));
+    expect(parsed[0]).toMatchObject({
+      event: 'diagnostic',
+      data: {
+        type: 'native_session_recovery',
+        nativeSessionRecovery: {
+          agentId: 'amr',
+          state: 'resumed',
+          handle: { display: null, redacted: true },
+        },
+      },
+    });
   });
 
   it('exposes eventsLogPath on statusBody when runsLogDir is configured', () => {

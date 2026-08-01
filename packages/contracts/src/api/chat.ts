@@ -1,4 +1,4 @@
-import type { ProjectFile } from './files';
+import type { ProjectFile, ProjectFileKind } from './files';
 import type { RunResultPackageResponse, RunWorkspace } from './workspaces.js';
 import type {
   PreviewCommentAttachment,
@@ -13,11 +13,62 @@ import type { RunContextSelection } from './context.js';
 import type { MediaExecutionPolicy } from './media.js';
 import type { AppliedPluginSnapshot } from '../plugins/apply.js';
 import type { McpAuthMode, McpServerConfig, McpTransport } from './mcp';
-import type { TrackingRuntimeType } from '../analytics/public-params.js';
+import type {
+  AnalyticsAttributionQuality,
+  AnalyticsDistributionMechanism,
+  AnalyticsEntrySurface,
+  AnalyticsHostProduct,
+  AnalyticsPublisherClass,
+  TrackingRuntimeType,
+} from '../analytics/public-params.js';
+import type {
+  TrackingRunFailureCategory,
+  TrackingRunFailureDetail,
+} from '../analytics/events.js';
+
+// The daemon's run-failure taxonomy, re-exported under product-facing names so
+// the run-status/error surface can carry the specific cause the daemon already
+// classified (see apps/daemon/src/run-failure-classification.ts) instead of
+// only the coarse `errorCode`. Same string unions as the analytics events, so
+// producer and consumer can't drift.
+export type RunFailureCategory = TrackingRunFailureCategory;
+export type RunFailureDetail = TrackingRunFailureDetail;
+export type RunFailureAction = 'relogin' | 'recharge' | 'upgrade' | 'retry' | 'none';
 
 export type ChatRole = 'user' | 'assistant';
-export type ChatSessionMode = 'design' | 'chat';
+export type ChatSessionMode = 'design' | 'chat' | 'plan';
 export type ChatCommentSelectionKind = PreviewCommentSelectionKind | 'visual';
+export type ByokChatProtocol =
+  | 'anthropic'
+  | 'openai'
+  | 'azure'
+  | 'google'
+  | 'ollama'
+  | 'senseaudio'
+  | 'aihubmix';
+
+export interface ByokChatProviderConfig {
+  protocol: ByokChatProtocol;
+  apiKey: string;
+  baseUrl?: string;
+  apiVersion?: string;
+  /** Explicit run-scoped provider policy for presets that do not require bearer credentials. */
+  requiresApiKey?: boolean;
+  /**
+   * Run-scoped chat model id selected in the chat UI. Forwarded to the daemon
+   * so BYOK-backed utilities (e.g. memory extraction) can honor the user's
+   * model picker instead of falling back to a hardcoded default. Optional
+   * because some presets (e.g. Ollama) infer the model from baseUrl/protocol.
+   */
+  model?: string;
+}
+
+export interface ByokMediaDefaults {
+  imageModel?: string;
+  videoModel?: string;
+  speechModel?: string;
+  speechVoice?: string;
+}
 
 export interface ChatRequest {
   agentId: string;
@@ -42,6 +93,17 @@ export interface ChatRequest {
   commentAttachments?: ChatCommentAttachment[];
   model?: string | null;
   reasoning?: string | null;
+  serviceTier?: string | null;
+  /**
+   * Non-secret reference to a daemon-owned BYOK profile. Runtime credentials
+   * are resolved from OS secure storage immediately before child spawn.
+   */
+  byokProfileId?: string;
+  /**
+   * Run-scoped BYOK media defaults selected in the chat UI. The daemon uses
+   * these to guide OpenCode-backed `od media generate` calls for this run only.
+   */
+  byokMediaDefaults?: ByokMediaDefaults;
   /** UI locale selected by the client, used by prompt composition for user-visible generated UI. */
   locale?: string;
   research?: ResearchOptions;
@@ -112,6 +174,7 @@ export type ChatAnalyticsLengthBucket =
 export type ChatAnalyticsDesignSystemOrigin =
   | 'onboarding'
   | 'manual_create'
+  | 'source_url'
   | 'github_repo'
   | 'local_code'
   | 'fig'
@@ -156,11 +219,36 @@ export interface ChatAnalyticsHints {
   turnIndex?: number;
   isFirstRun?: boolean;
   hasExistingArtifact?: boolean;
+  // Per-project run turn index (0-based, project-lifetime on this device):
+  // "within THIS project, which prompt / follow-up number is this?". Unlike
+  // `turnIndex` (session-wide, spans all projects and resets each browser
+  // session), this persists in localStorage keyed by project id. Optional:
+  // omitted when storage is unavailable (SSR / privacy mode).
+  projectTurnIndex?: number;
   // Active execution runtime for THIS run, computed client-side at launch
   // (the only layer that can tell BYOK from amr_cloud). The daemon stamps it
   // onto run_created / run_finished, overriding its own BYOK-blind
   // derivation. Omitted means "let the daemon keep its derived value".
   runtimeType?: TrackingRuntimeType;
+  // Analytics-only marker that THIS run is the AI-optimize ("enrich") pass on a
+  // programmatically-extracted design system. The web AI-optimize path sets it;
+  // the daemon uses it to emit `design_system_enrich_result` and to stamp the
+  // `ai_refined` enrichment metadata on success. It carries no execution
+  // semantics — omitting it just means the run is not an enrichment pass.
+  dsEnrichment?: boolean;
+  /** Bounded source attribution for local MCP/plugin initiated runs. */
+  entrySurface?: AnalyticsEntrySurface;
+  hostProduct?: AnalyticsHostProduct;
+  externalPluginId?: string;
+  externalPluginVersion?: string;
+  distributionMechanism?: AnalyticsDistributionMechanism;
+  publisherClass?: AnalyticsPublisherClass;
+  attributionQuality?: AnalyticsAttributionQuality;
+  pluginWorkflowId?: string;
+  logicalRequestDigest?: string;
+  logicalRequestDigestVersion?: number;
+  /** Daemon-computed and frozen for Plugin generation maturity queries. */
+  generationSloWindowMs?: number;
 }
 
 export interface RunScopedMcpServerConfig extends Omit<McpServerConfig, 'enabled'> {
@@ -214,10 +302,16 @@ export interface BrowserUseRunState {
   diagnostics: BrowserUseDiscoveryFacts;
 }
 
+/**
+ * Web chat POST /api/runs body. `conversationId` is required (web always has a
+ * chat home). `assistantMessageId` is optional: when omitted the daemon mints
+ * one so multi-turn native session resume still gets a pin cursor.
+ */
 export interface ChatRunCreateRequest extends ChatRequest {
   projectId: string;
   conversationId: string;
-  assistantMessageId: string;
+  /** Client pin id; daemon mints when omitted (API / omit-pin clients). */
+  assistantMessageId?: string;
   clientRequestId: string;
 }
 
@@ -226,17 +320,30 @@ export interface ChatRunCreateRequest extends ChatRequest {
  * manage conversation state client-side. Only `projectId` is required;
  * `message` and `agentId` are optional — the daemon resolves `agentId` from
  * the saved app-config when it is omitted.
+ *
+ * Callers may optionally bind `conversationId` (and omit `assistantMessageId`);
+ * the daemon mints the pin and seeds the user message when the conversation
+ * is bound and owned by `projectId`.
  */
 export interface McpRunCreateRequest {
   projectId: string;
+  /** Optional bound conversation; when set without assistantMessageId the daemon mints a pin. */
+  conversationId?: string;
+  /** Optional client pin; omit to let the daemon mint when a conversation is bound. */
+  assistantMessageId?: string;
+  /** Stable id generated once per confirmed user action and reused on transport retry. */
+  clientRequestId?: string;
   message?: string;
   agentId?: string;
   skillId?: string;
   pluginId?: string;
   model?: string;
+  serviceTier?: string;
   pluginInputs?: Record<string, unknown>;
   mediaExecution?: MediaExecutionPolicy;
   toolBundle?: RunScopedToolBundle;
+  resume?: boolean;
+  analyticsHints?: ChatAnalyticsHints;
 }
 
 export const CHAT_RUN_STATUSES = [
@@ -248,6 +355,9 @@ export const CHAT_RUN_STATUSES = [
 ] as const;
 
 export type ChatRunStatus = (typeof CHAT_RUN_STATUSES)[number];
+
+/** User-facing result delivery, kept separate from agent-process runStatus. */
+export type ResultDeliveryState = 'delivered' | 'no_result' | 'delivery_failed';
 
 export type ChatMessageFeedbackRating = 'positive' | 'negative';
 
@@ -311,6 +421,69 @@ export interface ChatRunCreateResponse {
   assistantMessageId?: string | null;
   appliedPluginSnapshotId?: string | null;
   pluginId?: string | null;
+  /** Analytics-only data-quality signal; it never changes run reuse semantics. */
+  analyticsAttributionMismatch?: boolean;
+}
+
+export type NativeSessionRecoveryState =
+  | 'not_applicable'
+  | 'no_recoverable_session'
+  | 'captured_not_resumed'
+  | 'resume_attempted'
+  | 'resumed'
+  | 'resume_skipped'
+  | 'auto_reseeded';
+
+export type NativeSessionHandleKind =
+  | 'opaque-id'
+  | 'cli-thread-id'
+  | 'acp-session-handle'
+  | 'session-file-path'
+  | 'unknown';
+
+export type NativeSessionAcquisitionMode =
+  | 'daemon-specified'
+  | 'stream-captured'
+  | 'acp-session-load'
+  | 'session-file-discovered'
+  | 'none'
+  | 'unknown';
+
+export type NativeSessionContinuationMode =
+  | 'native-resume-by-id'
+  | 'acp-session-load'
+  | 'session-file-resume'
+  | 'none'
+  | 'unknown';
+
+export type NativeSessionRecoveryReason =
+  | 'model_changed'
+  | 'cwd_changed'
+  | 'conversation_advanced'
+  | 'missing_cursor'
+  | 'resume_failed'
+  | 'unsupported'
+  | 'none';
+
+export interface NativeSessionRecoveryHandle {
+  present: boolean;
+  kind: NativeSessionHandleKind;
+  /** Always null unless a future per-agent rule declares the handle safe. */
+  display: string | null;
+  /** Stable correlation value for support without exposing the raw handle. */
+  sha256: string | null;
+  redacted: boolean;
+}
+
+export interface NativeSessionRecoveryMetadata {
+  agentId: string | null;
+  state: NativeSessionRecoveryState;
+  acquisition: NativeSessionAcquisitionMode;
+  continuation: NativeSessionContinuationMode;
+  handle: NativeSessionRecoveryHandle;
+  guardReason: NativeSessionRecoveryReason | null;
+  fallbackReason: NativeSessionRecoveryReason | null;
+  updatedAt: number;
 }
 
 export interface ChatRunStatusResponse {
@@ -318,6 +491,8 @@ export interface ChatRunStatusResponse {
   projectId: string | null;
   conversationId: string | null;
   assistantMessageId: string | null;
+  /** Stable caller request id used to suppress duplicate logical runs. */
+  clientRequestId?: string | null;
   agentId: string | null;
   /** Design system whose prompt context was actually injected for this run. */
   designSystemId?: string | null;
@@ -341,6 +516,17 @@ export interface ChatRunStatusResponse {
   signal?: string | null;
   error?: string | null;
   errorCode?: string | null;
+  /** Coarse failure family the daemon classified this failure into (auth,
+   *  rate_limit, model_unavailable, …). Lets the UI refine guidance beyond the
+   *  raw `errorCode` — e.g. distinguishing a transient 429 from a hard quota
+   *  that share `errorCode: 'RATE_LIMITED'`. Absent on success / older daemons. */
+  failureCategory?: RunFailureCategory | null;
+  /** Fine-grained failure cause within the category (hard_quota,
+   *  cli_not_installed, invalid_api_key, …). Primary key the UI maps to a named
+   *  failure type + fix. Absent on success / older daemons. */
+  failureDetail?: RunFailureDetail | null;
+  /** Recommended recovery action derived from the same failure classification. */
+  failureAction?: RunFailureAction | null;
   /** True when this terminal failure can be recovered by resuming the agent's
    *  existing CLI session (a transient upstream drop / inactivity timeout on a
    *  session-resuming runtime), rather than only restarting from scratch. The
@@ -348,6 +534,35 @@ export interface ChatRunStatusResponse {
    *  conversation resumes the persisted session. Absent/false on success,
    *  non-resumable failures, and runtimes without CLI session resume. */
   resumable?: boolean;
+  /** True when a terminal `succeeded` run ended with its declared work
+   *  unfinished — the agent left a TodoWrite task in a non-`completed` state
+   *  (pending / in_progress / stopped) or the turn was truncated mid-generation
+   *  (max_tokens). Lets every status surface (Pet task center, project pill, CLI
+   *  --json) avoid reading an incomplete run as "Completed" (#1247 / #1060).
+   *  Absent/false = finished, so older daemons stay "Completed" (backward-compat).
+   *  Judged by the canonical `todoSnapshotHasUnfinishedWork` predicate so it can
+   *  never diverge from the chat footer's `unfinishedTodosFromEvents`. */
+  endedWithUnfinishedWork?: boolean;
+  /** Authoritative artifact files created or modified by this run. Mirrors
+   *  ChatSseEndPayload.artifactCount and run_finished.artifact_count. */
+  artifactCount?: number;
+  /** Filesystem-backed validation of the one canonical artifact entry this
+   *  run can deliver. Present for terminal runs when the daemon can inspect
+   *  the project; callers must not infer validity from artifactCount alone. */
+  deliverableValid?: boolean;
+  deliverableValidation?:
+    | 'valid'
+    | 'not_succeeded'
+    | 'no_artifact'
+    | 'project_missing'
+    | 'entry_missing'
+    | 'entry_not_touched'
+    | 'entry_unreadable'
+    | 'type_mismatch';
+  /** Canonical project-relative file selected by deliverable validation. */
+  deliverableEntryFile?: string;
+  /** File kind of deliverableEntryFile, derived from the daemon file index. */
+  deliverableArtifactKind?: ProjectFileKind;
   /** Absolute path to the per-run JSONL event log the daemon mirrors
    *  the SSE stream to (see runs.ts `runsLogDir`). Null when the
    *  daemon was launched without event persistence configured. */
@@ -362,6 +577,8 @@ export interface ChatRunStatusResponse {
     hit: boolean;
     missReason: 'new-session' | 'missing-stored-hash' | 'stable-prompt-changed' | null;
   };
+  /** Sanitized native-session recovery state for resume-capable agents. */
+  nativeSessionRecovery?: NativeSessionRecoveryMetadata;
   /** Browser Use availability for runs that requested in-app browser automation. */
   browserUse?: BrowserUseRunState;
   /** Effective storage/provenance for the workspace used by this run. */
@@ -422,7 +639,17 @@ export type PersistedAgentEvent =
   // `code` carries the structured API error code for `label: 'error'`
   // status events (e.g. AGENT_AUTH_REQUIRED, RATE_LIMITED). Clients use it to
   // decide error-specific affordances such as the hosted-AMR nudge.
-  | { kind: 'status'; label: string; detail?: string; code?: string }
+  // `failureCategory` / `failureDetail` carry the daemon's finer classification
+  // for the same failure, so the error card can name a specific type + fix even
+  // when many causes share one `code` (e.g. hard_quota vs a transient 429).
+  | {
+      kind: 'status';
+      label: string;
+      detail?: string;
+      code?: string;
+      failureCategory?: RunFailureCategory;
+      failureDetail?: RunFailureDetail;
+    }
   | { kind: 'text'; text: string }
   | { kind: 'conversation_title'; title: string }
   | { kind: 'thinking'; text: string }
@@ -444,8 +671,31 @@ export type PersistedAgentEvent =
       refreshedSourceCount?: number;
       error?: string;
     }
-  | { kind: 'tool_use'; id: string; name: string; input: unknown }
+  | {
+      kind: 'tool_use';
+      id: string;
+      name: string;
+      input: unknown;
+      /** Optional wall-clock ms when the tool first started (e.g. ACP first frame). */
+      startedAt?: number;
+    }
   | { kind: 'tool_result'; toolUseId: string; content: string; isError: boolean }
+  | {
+      kind: 'diagnostic';
+      name: string;
+      source?: string;
+      elapsedMs?: number;
+      reason?: string;
+      suppressedChars?: number;
+      suppressedChunks?: number;
+      openedBlocks?: number;
+      closedBlocks?: number;
+      fileCount?: number;
+      files?: string[];
+      pendingCandidateChars?: number;
+      suppressing?: boolean;
+      shape?: Record<string, unknown>;
+    }
   | {
       kind: 'plugin_candidate';
       candidateId: string;
@@ -454,7 +704,16 @@ export type PersistedAgentEvent =
       confidence?: number;
       draftPath?: string | null;
     }
-  | { kind: 'usage'; inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number }
+  | {
+      kind: 'usage';
+      inputTokens?: number;
+      outputTokens?: number;
+      costUsd?: number;
+      durationMs?: number;
+      /** Terminal turn stop reason (e.g. `max_tokens`). Persisted so the project
+       *  projection can read a truncation as incomplete after reload (#1247). */
+      stopReason?: string;
+    }
   | { kind: 'raw'; line: string };
 
 export interface ChatMessage {
@@ -467,6 +726,7 @@ export interface ChatMessage {
   createdAt?: number;
   runId?: string;
   runStatus?: ChatRunStatus;
+  resultDeliveryState?: ResultDeliveryState;
   /** True when this message's failed run can be recovered by resuming the
    *  agent's CLI session (transient upstream drop / inactivity on a
    *  session-resuming runtime). Drives the chat's Continue affordance; mirrors
@@ -481,6 +741,7 @@ export interface ChatMessage {
   attachments?: ChatAttachment[];
   commentAttachments?: ChatCommentAttachment[];
   producedFiles?: ProjectFile[];
+  traceObjectFiles?: ProjectFile[];
   // Diff baseline so reattach can rebuild producedFiles after reload.
   preTurnFileNames?: string[];
   feedback?: ChatMessageFeedback;

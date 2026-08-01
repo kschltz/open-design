@@ -11,7 +11,7 @@
 //
 // The parser + payload types live in '@open-design/contracts' (od-card.ts) so
 // web and daemon share one source of truth. This file only renders.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type {
   OdCard,
   OdCardTaskBrief,
@@ -20,9 +20,11 @@ import type {
   OdCardVerifyScorecard,
   OdCardRowStatus,
   OdCardRuleProposal,
+  OdCardBrandBrowserAssist,
 } from '@open-design/contracts';
 import { Button } from '@open-design/components';
 import { Icon, type IconName } from './Icon';
+import { UserActionCard } from './UserActionCard';
 import { useT } from '../i18n';
 import styles from './OdCard.module.css';
 
@@ -30,8 +32,14 @@ const RULE_PROPOSAL_DECISION_PREFIX = 'od:rule-proposal-decision:';
 
 type RuleProposalDecision =
   | { status: 'idle' }
-  | { status: 'saved'; name: string }
+  | { status: 'saved'; name: string; id?: string }
   | { status: 'discarded' };
+
+type MemoryEntrySummaryLike = {
+  id?: unknown;
+  name?: unknown;
+  type?: unknown;
+};
 
 function hashRuleProposalKey(input: string): string {
   let hash = 5381;
@@ -65,12 +73,22 @@ function readRuleProposalDecision(key: string): RuleProposalDecision {
       return {
         status: 'saved',
         name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : '',
+        ...(typeof parsed.id === 'string' && parsed.id.trim() ? { id: parsed.id } : {}),
       };
     }
   } catch {
     // Storage can be unavailable in hardened contexts; fall back to per-mount state.
   }
   return { status: 'idle' };
+}
+
+function clearRuleProposalDecision(key: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Best effort only: storage can be unavailable in hardened contexts.
+  }
 }
 
 function writeRuleProposalDecision(key: string, decision: Exclude<RuleProposalDecision, { status: 'idle' }>) {
@@ -82,7 +100,52 @@ function writeRuleProposalDecision(key: string, decision: Exclude<RuleProposalDe
   }
 }
 
-export function OdCardView({ card, instanceScope }: { card: OdCard; instanceScope?: string }) {
+/** Outcome a brand-browser-assist confirm handler reports back to the card so it
+ *  can show a completed / error state. */
+export interface BrandBrowserAssistResult {
+  ok: boolean;
+  /** `opened` means the Browser tab was focused/navigated; extraction still
+   * continues from the next-step action after the user clears verification. */
+  action?: 'opened' | 'confirmed';
+  /** Failure reason to show inline (e.g. "needs the desktop app"). */
+  message?: string;
+}
+
+export type BrandBrowserAssistConfirm = (
+  card: OdCardBrandBrowserAssist,
+) => Promise<BrandBrowserAssistResult | void> | BrandBrowserAssistResult | void;
+
+function isMatchingRuleEntry(decision: Extract<RuleProposalDecision, { status: 'saved' }>, entry: MemoryEntrySummaryLike) {
+  if (entry.type !== 'rule') return false;
+  if (decision.id && entry.id === decision.id) return true;
+  return typeof entry.name === 'string' && entry.name === decision.name;
+}
+
+async function validateCachedRuleProposalDecision(
+  decision: RuleProposalDecision,
+): Promise<RuleProposalDecision | null> {
+  if (decision.status === 'idle') return decision;
+
+  const resp = await fetch('/api/memory');
+  if (!resp.ok) return null;
+  if (decision.status === 'discarded') return decision;
+
+  const body = await resp.json().catch(() => null) as { entries?: unknown } | null;
+  if (!Array.isArray(body?.entries)) return null;
+
+  const entries = body.entries as MemoryEntrySummaryLike[];
+  return entries.some((entry) => isMatchingRuleEntry(decision, entry)) ? decision : { status: 'idle' };
+}
+
+export function OdCardView({
+  card,
+  instanceScope,
+  onBrandBrowserAssistConfirm,
+}: {
+  card: OdCard;
+  instanceScope?: string;
+  onBrandBrowserAssistConfirm?: BrandBrowserAssistConfirm;
+}) {
   switch (card.kind) {
     case 'task-brief':
       return <TaskBriefCard card={card} />;
@@ -92,6 +155,8 @@ export function OdCardView({ card, instanceScope }: { card: OdCard; instanceScop
       return <VerifyScorecardCard card={card} />;
     case 'rule-proposal':
       return <RuleProposalCard card={card} instanceScope={instanceScope} />;
+    case 'brand-browser-assist':
+      return <BrandBrowserAssistCard card={card} onConfirm={onBrandBrowserAssistConfirm} />;
     default:
       return null;
   }
@@ -205,15 +270,31 @@ const SCORE_ROW_CLASS: Record<OdCardRowStatus, string> = {
 // pass/fail/fixed icon, the rule text, and the note. Light and scannable.
 function VerifyScorecardCard({ card }: { card: OdCardVerifyScorecard }) {
   const t = useT();
+  // Passing validation is supporting evidence, so keep it to one quiet line.
+  // Partial/failed validation is actionable and starts open, but only failed
+  // rules are promoted; passing rows remain available when an all-pass card is
+  // explicitly expanded instead of competing with the answer by default.
+  const [open, setOpen] = useState(card.status !== 'pass');
   const statusLabel =
     card.status === 'pass'
       ? t('artifact.odCardScorecardStatusPass')
       : card.status === 'partial'
         ? t('artifact.odCardScorecardStatusPartial')
         : t('artifact.odCardScorecardStatusFail');
+  const failedRows = card.rows.filter((row) => row.status === 'fail');
+  const visibleRows = card.status === 'pass'
+    ? card.rows
+    : failedRows.length > 0
+      ? failedRows
+      : card.rows.filter((row) => row.status !== 'pass');
   return (
     <div className={`${styles.card} ${styles.scorecard}`} data-od-card="verify-scorecard">
-      <div className={styles.scorecardHead}>
+      <button
+        type="button"
+        className={styles.scorecardHead}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
         <span className={`${styles.scorecardPill} ${SCORECARD_PILL_CLASS[card.status]}`}>
           {statusLabel}
         </span>
@@ -223,25 +304,33 @@ function VerifyScorecardCard({ card }: { card: OdCardVerifyScorecard }) {
         {card.summary ? (
           <span className={styles.scorecardSummary}>{card.summary}</span>
         ) : null}
+        <span className={styles.scorecardCount}>{card.rows.length}</span>
+        <span className={`${styles.scorecardChevron}${open ? ` ${styles.scorecardChevronOpen}` : ''}`} aria-hidden>
+          <Icon name="chevron-down" size={13} />
+        </span>
+      </button>
+      <div className={`accordion-collapsible${open ? ' open' : ''}`}>
+        <div className="accordion-collapsible-inner">
+          <ul className={styles.scoreRows}>
+            {visibleRows.map((row, i) => (
+              <li
+                key={`${row.rule}-${i}`}
+                className={`${styles.scoreRow} ${SCORE_ROW_CLASS[row.status]}`}
+              >
+                <span className={styles.scoreRowIcon} aria-hidden>
+                  <Icon name={ROW_STATUS_ICON[row.status]} size={13} />
+                </span>
+                <span className={styles.scoreRowBody}>
+                  <span className={styles.scoreRowRule}>{row.rule}</span>
+                  {row.note ? (
+                    <span className={styles.scoreRowNote}>{row.note}</span>
+                  ) : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       </div>
-      <ul className={styles.scoreRows}>
-        {card.rows.map((row, i) => (
-          <li
-            key={`${row.rule}-${i}`}
-            className={`${styles.scoreRow} ${SCORE_ROW_CLASS[row.status]}`}
-          >
-            <span className={styles.scoreRowIcon} aria-hidden>
-              <Icon name={ROW_STATUS_ICON[row.status]} size={13} />
-            </span>
-            <span className={styles.scoreRowBody}>
-              <span className={styles.scoreRowRule}>{row.rule}</span>
-              {row.note ? (
-                <span className={styles.scoreRowNote}>{row.note}</span>
-              ) : null}
-            </span>
-          </li>
-        ))}
-      </ul>
     </div>
   );
 }
@@ -271,7 +360,29 @@ function RuleProposalCard({
   const [check, setCheck] = useState(card.check);
   const [rationale, setRationale] = useState(card.rationale ?? '');
   const [editing, setEditing] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [status, setStatus] = useState<'idle' | 'saving' | 'error'>('idle');
+
+  useEffect(() => {
+    const cachedDecision = readRuleProposalDecision(storageKey);
+    if (cachedDecision.status === 'idle') return;
+
+    let cancelled = false;
+    void validateCachedRuleProposalDecision(cachedDecision)
+      .then((validated) => {
+        if (cancelled || !validated) return;
+        if (validated.status === 'idle') {
+          clearRuleProposalDecision(storageKey);
+          setDecision({ status: 'idle' });
+        }
+      })
+      .catch(() => {
+        // Keep the cached state on transient validation failures.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [storageKey]);
 
   if (decision.status === 'discarded') return null;
 
@@ -318,7 +429,12 @@ function RuleProposalCard({
         setStatus('error');
         return;
       }
-      const savedDecision = { status: 'saved', name: name.trim() } as const;
+      const body = await resp.json().catch(() => null) as { entry?: { id?: unknown } } | null;
+      const savedDecision = {
+        status: 'saved',
+        name: name.trim(),
+        ...(typeof body?.entry?.id === 'string' ? { id: body.entry.id } : {}),
+      } as const;
       writeRuleProposalDecision(storageKey, savedDecision);
       setDecision(savedDecision);
       setStatus('idle');
@@ -328,86 +444,22 @@ function RuleProposalCard({
   };
 
   return (
-    <div className={`${styles.card} ${styles.ruleCard}`} data-od-card="rule-proposal">
-      <div className={styles.ruleHead}>
-        <span className={styles.ruleHeadIcon} aria-hidden>
-          <Icon name="star" size={13} />
-        </span>
-        <span className={styles.ruleKicker}>
-          {t('artifact.odCardRuleKicker')}
-        </span>
-      </div>
-      {editing ? (
-        <div className={styles.ruleFields}>
-          <label className={styles.ruleFieldLabel}>
-            {t('artifact.odCardRuleNameLabel')}
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          <label className={styles.ruleFieldLabel}>
-            {t('artifact.odCardRuleDescriptionLabel')}
-            <input
-              type="text"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </label>
-          <label className={styles.ruleFieldLabel}>
-            {t('artifact.odCardRuleAssertionLabel')}
-            <textarea
-              rows={2}
-              value={assertion}
-              onChange={(e) => setAssertion(e.target.value)}
-            />
-          </label>
-          <label className={styles.ruleFieldLabel}>
-            {t('artifact.odCardRuleCheckLabel')}
-            <textarea
-              rows={2}
-              value={check}
-              onChange={(e) => setCheck(e.target.value)}
-            />
-          </label>
-          <label className={styles.ruleFieldLabel}>
-            {t('artifact.odCardRuleRationaleLabel')}
-            <input
-              type="text"
-              value={rationale}
-              onChange={(e) => setRationale(e.target.value)}
-            />
-          </label>
-        </div>
-      ) : (
-        <div className={styles.ruleSummary}>
-          <h5 className={styles.ruleName}>{name}</h5>
-          {description ? <p className={styles.ruleDescription}>{description}</p> : null}
-          <dl className={styles.ruleFacts}>
-            <div>
-              <dt>{t('artifact.odCardRuleAssertionLabel')}</dt>
-              <dd>{assertion}</dd>
-            </div>
-            <div>
-              <dt>{t('artifact.odCardRuleCheckLabel')}</dt>
-              <dd>{check}</dd>
-            </div>
-            {rationale ? (
-              <div>
-                <dt>{t('artifact.odCardRuleRationaleLabel')}</dt>
-                <dd>{rationale}</dd>
-              </div>
-            ) : null}
-          </dl>
-        </div>
+    <UserActionCard
+      dataKind="rule-proposal"
+      dataOdCard="rule-proposal"
+      icon="star"
+      title={(
+        <>
+          {t('artifact.odCardRuleKicker')} · <span>{name}</span>
+        </>
       )}
-      {status === 'error' ? (
-        <p className={styles.ruleError} role="status">
-          {t('artifact.odCardRuleError')}
-        </p>
-      ) : null}
-      <div className={styles.ruleActions}>
+      open={detailsOpen || editing}
+      onOpenChange={(open) => {
+        if (!open && editing) setEditing(false);
+        setDetailsOpen(open);
+      }}
+      detailsLabel={t('brand.viewDetails')}
+      actions={
         <Button
           variant="primary"
           className={styles.ruleAction}
@@ -418,27 +470,211 @@ function RuleProposalCard({
             ? t('artifact.odCardRuleSaving')
             : t('artifact.odCardRuleKeep')}
         </Button>
+      }
+      details={
+        <>
+          {editing ? (
+            <div className={styles.ruleFields}>
+              <label className={styles.ruleFieldLabel}>
+                {t('artifact.odCardRuleNameLabel')}
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </label>
+              <label className={styles.ruleFieldLabel}>
+                {t('artifact.odCardRuleDescriptionLabel')}
+                <input
+                  type="text"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </label>
+              <label className={styles.ruleFieldLabel}>
+                {t('artifact.odCardRuleAssertionLabel')}
+                <textarea
+                  rows={2}
+                  value={assertion}
+                  onChange={(e) => setAssertion(e.target.value)}
+                />
+              </label>
+              <label className={styles.ruleFieldLabel}>
+                {t('artifact.odCardRuleCheckLabel')}
+                <textarea
+                  rows={2}
+                  value={check}
+                  onChange={(e) => setCheck(e.target.value)}
+                />
+              </label>
+              <label className={styles.ruleFieldLabel}>
+                {t('artifact.odCardRuleRationaleLabel')}
+                <input
+                  type="text"
+                  value={rationale}
+                  onChange={(e) => setRationale(e.target.value)}
+                />
+              </label>
+            </div>
+          ) : (
+            <div className={styles.ruleSummary}>
+              {description ? <p className={styles.ruleDescription}>{description}</p> : null}
+              <dl className={styles.ruleFacts}>
+                <div>
+                  <dt>{t('artifact.odCardRuleAssertionLabel')}</dt>
+                  <dd>{assertion}</dd>
+                </div>
+                <div>
+                  <dt>{t('artifact.odCardRuleCheckLabel')}</dt>
+                  <dd>{check}</dd>
+                </div>
+                {rationale ? (
+                  <div>
+                    <dt>{t('artifact.odCardRuleRationaleLabel')}</dt>
+                    <dd>{rationale}</dd>
+                  </div>
+                ) : null}
+              </dl>
+            </div>
+          )}
+          {status === 'error' ? (
+            <p className={styles.ruleError} role="status">
+              {t('artifact.odCardRuleError')}
+            </p>
+          ) : null}
+          <div className={styles.ruleActions}>
+            <Button
+              variant="ghost"
+              className={styles.ruleAction}
+              disabled={status === 'saving'}
+              onClick={() => {
+                const nextEditing = !editing;
+                setEditing(nextEditing);
+                if (nextEditing) setDetailsOpen(true);
+              }}
+            >
+              {editing ? t('artifact.odCardRuleDone') : t('artifact.odCardRuleEdit')}
+            </Button>
+            <Button
+              variant="ghost"
+              className={styles.ruleAction}
+              disabled={status === 'saving'}
+              onClick={() => {
+                const discardedDecision = { status: 'discarded' } as const;
+                writeRuleProposalDecision(storageKey, discardedDecision);
+                setDecision(discardedDecision);
+              }}
+            >
+              {t('artifact.odCardRuleDiscard')}
+            </Button>
+          </div>
+        </>
+      }
+    />
+  );
+}
+
+const BRAND_ASSIST_DECISION_PREFIX = 'od:brand-browser-assist-decision:';
+
+function brandAssistStorageKey(brandId: string): string {
+  return `${BRAND_ASSIST_DECISION_PREFIX}${brandId}`;
+}
+
+function readBrandAssistDone(key: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(key) === 'done';
+  } catch {
+    return false;
+  }
+}
+
+function writeBrandAssistDone(key: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(key, 'done');
+  } catch {
+    // Best effort — the in-memory `done` state still shows the opened marker.
+  }
+}
+
+// Brand extraction hit an anti-bot wall. This card opens/focuses the in-app
+// browser tab so the user can clear verification, then the normal next-step
+// action continues extraction from that live page.
+// A localStorage marker keyed off the brand id remembers that the browser was
+// opened, but the action remains available because users may need to re-open the
+// Browser tab or re-trigger the Download Page highlight.
+function BrandBrowserAssistCard({
+  card,
+  onConfirm,
+}: {
+  card: OdCardBrandBrowserAssist;
+  onConfirm?: BrandBrowserAssistConfirm;
+}) {
+  const t = useT();
+  const storageKey = useMemo(() => brandAssistStorageKey(card.brandId), [card.brandId]);
+  const [done, setDone] = useState(() => readBrandAssistDone(storageKey));
+  const [status, setStatus] = useState<'idle' | 'working' | 'error'>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const confirm = async () => {
+    if (!onConfirm) return;
+    setStatus('working');
+    setErrorMsg(null);
+    try {
+      // `{ ok: true, action: "opened" }` means the Browser tab was focused and
+      // the user should clear verification before using the Continue next step.
+      // Plain `{ ok: true }` is kept for older handlers. Either successful
+      // outcome resolves this prompt so the card does not look unclicked.
+      const result = await onConfirm(card);
+      if (!result || result.ok !== true) {
+        setStatus('error');
+        setErrorMsg((result && result.message) || null);
+        return;
+      }
+      writeBrandAssistDone(storageKey);
+      setDone(true);
+      setStatus('idle');
+    } catch (err) {
+      setStatus('error');
+      setErrorMsg(err instanceof Error ? err.message : null);
+    }
+  };
+
+  return (
+    <UserActionCard
+      dataKind="browser-assist"
+      dataOdCard="brand-browser-assist"
+      icon="globe"
+      title={t('artifact.odCardBrandAssistKicker', { reason: card.reason || 'Browser' })}
+      detailsLabel={t('brand.viewDetails')}
+      actions={
         <Button
-          variant="ghost"
+          variant="primary"
           className={styles.ruleAction}
-          disabled={status === 'saving'}
-          onClick={() => setEditing((e) => !e)}
+          disabled={status === 'working' || !onConfirm}
+          onClick={() => void confirm()}
         >
-          {editing ? t('artifact.odCardRuleDone') : t('artifact.odCardRuleEdit')}
+          {status === 'working'
+            ? t('artifact.odCardBrandAssistWorking')
+            : t('artifact.odCardBrandAssistConfirm')}
         </Button>
-        <Button
-          variant="ghost"
-          className={styles.ruleAction}
-          disabled={status === 'saving'}
-          onClick={() => {
-            const discardedDecision = { status: 'discarded' } as const;
-            writeRuleProposalDecision(storageKey, discardedDecision);
-            setDecision(discardedDecision);
-          }}
-        >
-          {t('artifact.odCardRuleDiscard')}
-        </Button>
-      </div>
-    </div>
+      }
+      details={
+        <div className={styles.ruleSummary}>
+          <p className={styles.ruleDescription}>{t('artifact.odCardBrandAssistBody')}</p>
+          {card.url ? <p className={styles.ruleName}>{card.url}</p> : null}
+        </div>
+      }
+      status={done ? (
+        <span className={styles.ruleSavedLabel} role="status">
+          {t('artifact.odCardBrandAssistDone')}
+        </span>
+      ) : status === 'error' ? (
+        <span className={styles.ruleError} role="status">
+          {errorMsg || t('artifact.odCardBrandAssistError')}
+        </span>
+      ) : null}
+    />
   );
 }

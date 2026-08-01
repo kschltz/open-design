@@ -1,17 +1,20 @@
 import { expect, test } from '@/playwright/suite';
-import { ensureRailOpen } from '@/playwright/rail';
-import type { Locator, Page, Request, Route } from '@playwright/test';
-import { routeAgents } from '../lib/playwright/mock-factory.js';
+import { ensureRailOpen, openNewProjectModal } from '@/playwright/rail';
+import { openAllProjectFiles } from '@/playwright/workspace';
+import { T } from '@/timeouts';
+import type { Locator, Page, Request } from '@playwright/test';
+import { routeAgents, routeSuccessfulRuns } from '../lib/playwright/mock-factory.js';
 
 // The `/projects` view in `EntryShell` renders a `CenteredLoader` until
 // `projectsLoading || skillsLoading || designSystemsLoading` all clear
-// (`apps/web/src/components/EntryShell.tsx`), and `designSystemsLoading` only
-// clears once `GET /api/design-systems` resolves (`App.tsx` `dsLoading`). A test
-// that lands on `/projects` but leaves `/api/design-systems` unmocked therefore
-// gates its first assertion on the real daemon's response time — fast locally,
-// but a flaky >10s loader under CI load (this dequeued PR #4548 from the merge
-// queue). Stub the endpoint so the projects view renders deterministically.
-async function stubDesignSystemsEmpty(page: Page): Promise<void> {
+// (`apps/web/src/components/EntryShell.tsx`). Tests that land on `/projects`
+// should stub the catalog endpoints that are unrelated to the project-list
+// behavior under test; otherwise a large registry response can keep the first
+// assertion gated on daemon/catalog timing instead of the UI contract.
+async function stubCatalogsEmpty(page: Page): Promise<void> {
+  await page.route('**/api/design-templates', async (route) => {
+    await route.fulfill({ json: { designTemplates: [] } });
+  });
   await page.route('**/api/design-systems', async (route) => {
     await route.fulfill({ json: { designSystems: [] } });
   });
@@ -19,6 +22,32 @@ async function stubDesignSystemsEmpty(page: Page): Promise<void> {
 
 const STORAGE_KEY = 'open-design:config';
 const ACTIVE_ARTIFACT_PREVIEW_SELECTOR = '[data-testid="artifact-preview-frame"]:visible, [data-testid="artifact-preview-frame-url-load"]:visible, [data-testid="artifact-preview-frame-srcdoc"]:visible, [data-testid="live-artifact-preview-frame"]:visible';
+
+async function routeByokProfile(
+  page: Page,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await page.route('**/api/byok/profiles', async (route) => {
+    await route.fulfill({
+      json: {
+        available: true,
+        backend: 'test',
+        profiles: [{
+          id: config.byokProfileId,
+          label: 'OpenAI',
+          protocol: config.apiProtocol,
+          baseUrl: config.baseUrl,
+          model: config.model,
+          requiresApiKey: true,
+          configured: true,
+          keyTail: config.byokCredentialTail,
+          createdAt: 1,
+          updatedAt: 1,
+        }],
+      },
+    });
+  });
+}
 
 const AGENTS = [
   {
@@ -29,7 +58,12 @@ const AGENTS = [
     version: '0.134.0',
     models: [
       { id: 'default', label: 'Default (CLI config)' },
-      { id: 'gpt-5.5', label: 'GPT 5.5' },
+      {
+        id: 'gpt-5.5',
+        label: 'GPT 5.5',
+        additionalSpeedTiers: ['fast'],
+        serviceTierOptions: [{ id: 'priority', label: 'Fast' }],
+      },
     ],
   },
   {
@@ -69,6 +103,52 @@ const DESIGN_SYSTEMS = [
     swatches: ['#EAF4F4', '#5EAAA8', '#05668D', '#0B132B'],
   },
 ];
+
+async function stubEmptyProjectsNewProjectData(page: Page): Promise<void> {
+  await page.route('**/api/skills', async (route) => {
+    await route.fulfill({ json: { skills: TAB_SKILLS } });
+  });
+  await page.route('**/api/connectors', async (route) => {
+    await route.fulfill({ json: { connectors: [] } });
+  });
+  await page.route('**/api/connectors/status', async (route) => {
+    await route.fulfill({ json: { statuses: {} } });
+  });
+  await page.route('**/api/projects', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: { projects: [] } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route('**/api/design-systems', async (route) => {
+    await route.fulfill({ json: { designSystems: DESIGN_SYSTEMS } });
+  });
+}
+
+async function openNewProjectFromEmptyProjects(page: Page): Promise<void> {
+  await page.goto('/projects', { waitUntil: 'domcontentloaded' });
+  await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.locator('.designs-empty-state')).toBeVisible();
+  await page.getByTestId('designs-empty-new-project').click();
+
+  await expect(page.getByTestId('new-project-modal')).toBeVisible();
+  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+}
+
+async function openNewProjectFromLeftRail(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('od.entry.railOpen', 'true');
+  });
+  await page.goto('/projects', { waitUntil: 'domcontentloaded' });
+  await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: 15_000 });
+  await ensureRailOpen(page);
+  await expect(page.getByTestId('entry-nav-new-project')).toBeVisible();
+  await page.getByTestId('entry-nav-new-project').click();
+
+  await expect(page.getByTestId('new-project-modal')).toBeVisible();
+  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+}
 
 const TAB_SKILLS = [
   skillSummary('prototype-skill', 'Prototype Skill', 'prototype', 'web', ['prototype']),
@@ -163,55 +243,64 @@ function artifactPreviewFrame(page: Page) {
   return page.frameLocator(ACTIVE_ARTIFACT_PREVIEW_SELECTOR);
 }
 
-test('[P1] new project tabs switch visible form sections and preserve drafts', async ({ page }) => {
-  await page.route('**/api/skills', async (route) => {
-    await route.fulfill({ json: { skills: TAB_SKILLS } });
+test.describe('new project modal from left rail', () => {
+  // Timeout-only configure: both tests open the modal themselves against
+  // stubbed data; serial would make the pair atomic within one CI shard.
+  test.describe.configure({ timeout: 60_000 });
+
+  test('[P1] new project tabs switch visible form sections and preserve drafts', async ({ page }) => {
+    await stubEmptyProjectsNewProjectData(page);
+    await openNewProjectFromLeftRail(page);
+    await expect(page.getByTestId('new-project-tab-prototype')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New prototype');
+    await expect(page.getByTestId('design-system-trigger')).toBeVisible();
+    await expect(page.getByText('Fidelity', { exact: true })).toBeVisible();
+    await page.getByTestId('new-project-name').fill('Prototype draft survives');
+
+    await page.getByTestId('new-project-tab-live-artifact').click();
+    await expect(page.getByTestId('new-project-tab-live-artifact')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New live artifact');
+    await expect(page.locator('.newproj-title')).toContainText('Beta');
+    await expect(page.getByTestId('design-system-picker')).toHaveCount(0);
+    await expect(page.getByTestId('new-project-connectors')).toBeVisible();
+    await expect(page.getByTestId('create-project')).toContainText('Create live artifact');
+
+    await page.getByTestId('new-project-tab-deck').click();
+    await expect(page.getByTestId('new-project-tab-deck')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New slide deck');
+    await expect(page.getByTestId('design-system-trigger')).toBeVisible();
+    await expect(page.getByText('Use speaker notes')).toBeVisible();
+    await expect(page.getByTestId('new-project-connectors')).toHaveCount(0);
+
+    await page.getByTestId('new-project-tab-prototype').click();
+    await expect(page.getByTestId('new-project-tab-prototype')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New prototype');
+    await expect(page.getByTestId('new-project-name')).toHaveValue('Prototype draft survives');
   });
-  await page.route('**/api/connectors', async (route) => {
-    await route.fulfill({ json: { connectors: [] } });
+
+  test('[P1] new project media tab switches inner media surfaces', async ({ page }) => {
+    await stubEmptyProjectsNewProjectData(page);
+    await openNewProjectFromLeftRail(page);
+
+    // Playwright auto-scrolls the tab into view; the consolidated media flow
+    // keeps image/video/audio as inner segmented surfaces.
+    await page.getByTestId('new-project-tab-media').click();
+    await expect(page.getByTestId('new-project-tab-media')).toHaveAttribute('aria-selected', 'true');
+    await page.getByTestId('new-project-media-surface-image').click();
+    await expect(page.getByTestId('new-project-media-surface-image')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New image');
+    await expect(page.getByTestId('design-system-picker')).toHaveCount(0);
+    await expect(page.getByText('Model', { exact: true })).toBeVisible();
+    await expect(page.getByText('Aspect', { exact: true })).toBeVisible();
+
+    await page.getByTestId('new-project-media-surface-video').click();
+    await expect(page.getByTestId('new-project-media-surface-video')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New video');
+
+    await page.getByTestId('new-project-media-surface-audio').click();
+    await expect(page.getByTestId('new-project-media-surface-audio')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.newproj-title')).toContainText('New audio');
   });
-  await page.route('**/api/connectors/status', async (route) => {
-    await route.fulfill({ json: { statuses: {} } });
-  });
-
-  await page.goto('/');
-  await openNewProjectPanel(page);
-  await expect(page.getByTestId('new-project-tab-prototype')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('.newproj-title')).toContainText('New prototype');
-  await expect(page.getByTestId('design-system-trigger')).toBeVisible();
-  await expect(page.getByText('Fidelity', { exact: true })).toBeVisible();
-  await page.getByTestId('new-project-name').fill('Prototype draft survives');
-
-  await page.getByTestId('new-project-tab-live-artifact').click();
-  await expect(page.getByTestId('new-project-tab-live-artifact')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('.newproj-title')).toContainText('New live artifact');
-  await expect(page.locator('.newproj-title')).toContainText('Beta');
-  await expect(page.getByTestId('design-system-picker')).toHaveCount(0);
-  await expect(page.getByTestId('new-project-connectors')).toBeVisible();
-  await expect(page.getByTestId('create-project')).toContainText('Create live artifact');
-
-  await page.getByTestId('new-project-tab-deck').click();
-  await expect(page.getByTestId('new-project-tab-deck')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('.newproj-title')).toContainText('New slide deck');
-  await expect(page.getByTestId('design-system-trigger')).toBeVisible();
-  await expect(page.getByText('Use speaker notes')).toBeVisible();
-  await expect(page.getByTestId('new-project-connectors')).toHaveCount(0);
-
-  await page.getByTestId('new-project-tab-prototype').click();
-  await expect(page.getByTestId('new-project-tab-prototype')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('.newproj-title')).toContainText('New prototype');
-  await expect(page.getByTestId('new-project-name')).toHaveValue('Prototype draft survives');
-
-  // Playwright auto-scrolls the tab into view; the consolidated media flow
-  // keeps image/video/audio as inner segmented surfaces.
-  await page.getByTestId('new-project-tab-media').click();
-  await expect(page.getByTestId('new-project-tab-media')).toHaveAttribute('aria-selected', 'true');
-  await page.getByTestId('new-project-media-surface-image').click();
-  await expect(page.getByTestId('new-project-media-surface-image')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('.newproj-title')).toContainText('New image');
-  await expect(page.getByTestId('design-system-picker')).toHaveCount(0);
-  await expect(page.getByText('Model', { exact: true })).toBeVisible();
-  await expect(page.getByText('Aspect', { exact: true })).toBeVisible();
 });
 
 test('[P0] projects empty state create action opens the new project flow', async ({ page }) => {
@@ -229,13 +318,11 @@ test('[P0] projects empty state create action opens the new project flow', async
       await route.fulfill({ json: { projects: [] } });
       return;
     }
-    await route.continue();
+    await route.fallback();
   });
 
-  await stubDesignSystemsEmpty(page);
-  await page.goto('/projects');
-  await expect(page.locator('.designs-empty-state')).toBeVisible();
-  await page.locator('.designs-empty-cta').click();
+  await stubCatalogsEmpty(page);
+  await openNewProjectFromEmptyProjects(page);
 
   await expect(page.getByTestId('new-project-modal')).toBeVisible();
   await expect(page.getByTestId('new-project-panel')).toBeVisible();
@@ -244,12 +331,8 @@ test('[P0] projects empty state create action opens the new project flow', async
 });
 
 test('[P1] design system multi-select stores primary and inspiration metadata', async ({ page }) => {
-  await page.route('**/api/design-systems', async (route) => {
-    await route.fulfill({ json: { designSystems: DESIGN_SYSTEMS } });
-  });
-
-  await page.goto('/');
-  await openNewProjectPanel(page);
+  await stubEmptyProjectsNewProjectData(page);
+  await openNewProjectFromLeftRail(page);
   await page.getByTestId('new-project-tab-prototype').click();
   await page.getByTestId('new-project-name').fill('Design system multi select metadata');
   await expect(page.getByTestId('design-system-trigger')).toContainText('Nexu Soft Tech');
@@ -283,12 +366,8 @@ test('[P1] design system multi-select stores primary and inspiration metadata', 
 });
 
 test('[P1] design system picker searches and switches the single selected system', async ({ page }) => {
-  await page.route('**/api/design-systems', async (route) => {
-    await route.fulfill({ json: { designSystems: DESIGN_SYSTEMS } });
-  });
-
-  await page.goto('/');
-  await openNewProjectPanel(page);
+  await stubEmptyProjectsNewProjectData(page);
+  await openNewProjectFromLeftRail(page);
   await page.getByTestId('new-project-tab-prototype').click();
   await page.getByTestId('new-project-name').fill('Design system single switch flow');
   await expect(page.getByTestId('design-system-trigger')).toBeVisible();
@@ -315,35 +394,118 @@ test('[P1] design system picker searches and switches the single selected system
   expect(body.metadata?.inspirationDesignSystemIds).toBeUndefined();
 });
 
-test('[P2] project detail header keeps the title, design system picker, and execution controls aligned on one row', async ({ page }) => {
+test('[P1] design system picker can clear the default system before creating a project', async ({ page }) => {
+  await stubEmptyProjectsNewProjectData(page);
+  await openNewProjectFromLeftRail(page);
+  await page.getByTestId('new-project-tab-prototype').click();
+  await page.getByTestId('new-project-name').fill('Design system clear create flow');
+  await expect(page.getByTestId('design-system-trigger')).toContainText('Nexu Soft Tech');
+
+  await page.getByTestId('design-system-trigger').click();
+  await page.getByRole('option', { name: /None.*freeform/i }).click();
+
+  await expect(page.getByTestId('design-system-trigger')).toContainText('None');
+  await expect(page.getByTestId('design-system-trigger')).not.toContainText('Nexu Soft Tech');
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  await expect(page.getByTestId('create-project')).toBeEnabled();
+  await page.getByTestId('create-project').click({ force: true });
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    designSystemId?: string | null;
+    metadata?: {
+      inspirationDesignSystemIds?: string[];
+    };
+  };
+  expect(body.designSystemId).toBeNull();
+  expect(body.metadata?.inspirationDesignSystemIds).toBeUndefined();
+});
+
+test('[P1] stale daemon default design system is not posted when creating a project', async ({ page }) => {
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({
+        json: {
+          config: {
+            onboardingCompleted: true,
+            privacyDecisionAt: 1,
+            telemetry: { metrics: false, content: false, artifactManifest: false },
+            mode: 'daemon',
+            agentId: 'codex',
+            skillId: null,
+            designSystemId: 'stale-design-system',
+            agentModels: { codex: { model: 'default' } },
+            agentCliEnv: {},
+          },
+        },
+      });
+      return;
+    }
+    await route.fulfill({
+      json: {
+        config: {
+          onboardingCompleted: true,
+          privacyDecisionAt: 1,
+          telemetry: { metrics: false, content: false, artifactManifest: false },
+          mode: 'daemon',
+          agentId: 'codex',
+          skillId: null,
+          designSystemId: 'stale-design-system',
+          agentModels: { codex: { model: 'default' } },
+          agentCliEnv: {},
+        },
+      },
+    });
+  });
+  await stubEmptyProjectsNewProjectData(page);
+  await openNewProjectFromLeftRail(page);
+  await page.getByTestId('new-project-tab-prototype').click();
+  await page.getByTestId('new-project-name').fill('Stale design system default flow');
+
+  await expect(page.getByTestId('design-system-trigger')).toContainText('None');
+  await expect(page.getByTestId('design-system-trigger')).not.toContainText('stale-design-system');
+
+  const createProjectRequest = page.waitForRequest(isCreateProjectRequest);
+  await expect(page.getByTestId('create-project')).toBeEnabled();
+  await page.getByTestId('create-project').click({ force: true });
+  const request = await createProjectRequest;
+  const body = request.postDataJSON() as {
+    designSystemId?: string | null;
+    metadata?: {
+      inspirationDesignSystemIds?: string[];
+    };
+  };
+  expect(body.designSystemId).toBeNull();
+  expect(body.designSystemId).not.toBe('stale-design-system');
+  expect(body.metadata?.inspirationDesignSystemIds).toBeUndefined();
+});
+
+test('[P2] project detail header keeps the title and execution controls aligned on one row', async ({ page }) => {
   await page.goto('/');
   await createProject(page, 'Header controls stay pinned');
   await expectWorkspaceReady(page);
   await page.setViewportSize({ width: 1365, height: 900 });
 
   const title = page.getByTestId('project-title');
-  const dsTrigger = page.getByTestId('project-ds-picker-trigger');
-  const settingsButton = page.locator('.settings-icon-btn');
+  const settingsButton = page.getByTestId('entry-settings-menu-trigger');
   const handoffButton = page.getByRole('button', { name: /Choose hand-off target/i });
 
   await expect(title).toBeVisible();
-  await expect(dsTrigger).toBeVisible();
   await expect(settingsButton).toBeVisible();
   await expect(handoffButton).toBeVisible();
+  await expect(page.getByTestId('chat-composer').getByTestId('project-ds-picker-trigger')).toBeVisible();
 
-  const [titleBox, dsBox, settingsBox, handoffBox] = await Promise.all([
+  const [titleBox, settingsBox, handoffBox] = await Promise.all([
     title.boundingBox(),
-    dsTrigger.boundingBox(),
     settingsButton.boundingBox(),
     handoffButton.boundingBox(),
   ]);
 
   expect(titleBox).toBeTruthy();
-  expect(dsBox).toBeTruthy();
   expect(settingsBox).toBeTruthy();
   expect(handoffBox).toBeTruthy();
 
-  const yValues = [titleBox!.y, dsBox!.y, settingsBox!.y, handoffBox!.y];
+  const yValues = [titleBox!.y, settingsBox!.y, handoffBox!.y];
   expect(Math.max(...yValues) - Math.min(...yValues)).toBeLessThan(24);
 });
 
@@ -372,37 +534,16 @@ test('[P1] project detail header design system picker switches the active projec
   await editorialOption.click();
 
   await expect(popover).toHaveCount(0);
-  await expect(trigger).toContainText(/Editorial Noir/i);
 
   const request = await patchRequest;
   const body = request.postDataJSON() as { designSystemId?: string | null };
   expect(body.designSystemId).toBe('editorial-noir');
+  await expect(trigger).toBeVisible();
 });
 
 test('[P0] @critical project detail header design system switch carries into the next run request', async ({ page }) => {
   const runRequestBodies: Array<Record<string, unknown>> = [];
-  await page.route('**/api/runs', async (route) => {
-    const raw = route.request().postData();
-    if (raw) {
-      try {
-        runRequestBodies.push(JSON.parse(raw) as Record<string, unknown>);
-      } catch {
-        // ignore non-JSON bodies; assertion below will surface missing payloads
-      }
-    }
-    await route.fulfill({
-      status: 202,
-      contentType: 'application/json',
-      body: '{"runId":"mock-run"}',
-    });
-  });
-  await page.route('**/api/runs/*/events', async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
-      body: ['event: end', 'data: {"code":0,"status":"succeeded"}', '', ''].join('\n'),
-    });
-  });
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runId: 'mock-run' });
 
   await page.route('**/api/design-systems', async (route) => {
     await route.fulfill({ json: { designSystems: DESIGN_SYSTEMS } });
@@ -417,8 +558,13 @@ test('[P0] @critical project detail header design system switch carries into the
   await page.getByTestId('project-ds-picker-search').fill('editorial');
   const editorialOption = page.getByRole('option', { name: /^Editorial Noir$/ });
   await expect(editorialOption).toBeVisible();
+  const patchRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === `/api/projects/${getProjectContextFromUrl(page).projectId}` && request.method() === 'PATCH';
+  });
   await editorialOption.click();
-  await expect(trigger).toContainText(/Editorial Noir/i);
+  const patchBody = await patchRequest.then((request) => request.postDataJSON() as { designSystemId?: string | null });
+  expect(patchBody.designSystemId).toBe('editorial-noir');
 
   const input = page.getByTestId('chat-composer-input');
   await input.fill('Use the active design system in this layout.');
@@ -456,23 +602,6 @@ test('[P1] project detail composer working directory picker opens without leavin
   await expect(composer.getByTestId('working-dir-pick')).toBeVisible();
 });
 
-test('[P1] project detail composer session mode switches between Design and Ask', async ({ page }) => {
-  await page.goto('/');
-  await createProject(page, 'Composer session mode switch');
-  await expectWorkspaceReady(page);
-
-  const composer = page.getByTestId('chat-composer');
-  const trigger = composer.getByTestId('session-mode-trigger');
-  await expect(trigger).toContainText(/Design/i);
-  await trigger.click();
-  await page.getByRole('menuitemradio', { name: /Ask mode/i }).click();
-  await expect(trigger).toContainText(/Ask/i);
-
-  await trigger.click();
-  await page.getByRole('menuitemradio', { name: /Design mode/i }).click();
-  await expect(trigger).toContainText(/Design/i);
-});
-
 test('[P1] project detail composer plus menu exposes attachment, connector, plugin, and MCP entries', async ({ page }) => {
   await routeComposerPlusFixtures(page);
   await page.goto('/');
@@ -496,6 +625,605 @@ test('[P1] project detail composer plus menu exposes attachment, connector, plug
   await expect(page.getByRole('menuitem', { name: /Design Docs MCP/i })).toBeVisible();
 });
 
+test('[P1] project detail composer plus menu opens project, local code, Figma help, and design system context actions', async ({ page }) => {
+  const referenceProject = {
+    id: 'ref-project-context',
+    name: 'Reference Project Context',
+    skillId: null,
+    designSystemId: null,
+    createdAt: Date.now() - 1_000,
+    updatedAt: Date.now(),
+    metadata: {
+      kind: 'prototype',
+      nameSource: 'user',
+    },
+  };
+
+  await routeComposerPlusFixtures(page);
+  await page.route('**/api/projects', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: { projects: [referenceProject] } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route('**/api/projects/ref-project-context**', async (route) => {
+    await route.fulfill({
+      json: {
+        project: referenceProject,
+        resolvedDir: '/tmp/open-design/reference-project-context',
+      },
+    });
+  });
+  await page.route('**/api/projects/*', async (route) => {
+    if (route.request().method() !== 'PATCH') {
+      await route.fallback();
+      return;
+    }
+    const url = new URL(route.request().url());
+    const id = decodeURIComponent(url.pathname.split('/').pop() ?? 'composer-plus-context-actions');
+    const body = route.request().postDataJSON() as { metadata?: Record<string, unknown> };
+    await route.fulfill({
+      json: {
+        project: {
+          id,
+          name: 'Composer plus context actions',
+          skillId: null,
+          designSystemId: null,
+          createdAt: Date.now() - 1_000,
+          updatedAt: Date.now(),
+          metadata: body.metadata ?? { kind: 'prototype' },
+        },
+      },
+    });
+  });
+  await page.route('**/api/dialog/open-folder', async (route) => {
+    await route.fulfill({ json: { path: '/tmp/open-design/local-code-project' } });
+  });
+  await page.route('**/api/dir-exists', async (route) => {
+    await route.fulfill({ json: { exists: true } });
+  });
+
+  await page.goto('/');
+  await createProject(page, 'Composer plus context actions');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-reference-project').click();
+  const referenceDialog = page.getByRole('dialog', { name: 'Reference another project' });
+  await expect(referenceDialog).toBeVisible();
+  await expect(referenceDialog.getByRole('option', { name: /Reference Project Context/i })).toHaveAttribute('aria-selected', 'true');
+  await referenceDialog.getByRole('button', { name: 'Reference project' }).click();
+  await expect(referenceDialog).toHaveCount(0);
+  await expect(input).toContainText('Reference Project Context');
+  await expect(composer.locator('.staged-context--workspace', { hasText: 'Reference Project Context' })).toBeVisible();
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-local-code').click();
+  await expect(input).toContainText('local-code-project');
+  await expect(composer.locator('.staged-context--workspace', { hasText: 'local-code-project' })).toBeVisible();
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-figma-help').click();
+  const figmaHelp = page.getByRole('dialog', { name: 'How to download a .fig file' });
+  await expect(figmaHelp).toBeVisible();
+  await expect(figmaHelp).toContainText('Save local copy');
+  await figmaHelp.getByRole('button', { name: 'Close' }).click();
+  await expect(figmaHelp).toHaveCount(0);
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-design-system').click();
+  await expect(page.getByTestId('project-ds-picker-popover')).toBeVisible();
+});
+
+test('[P1] project detail Figma import uploads a .fig file and stages the suggested prompt', async ({ page }) => {
+  test.setTimeout(60_000);
+  const importBodies: string[] = [];
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  const suggestedPrompt = 'Build the current project from figma/DESIGN-context.md.';
+
+  await routeComposerPlusFixtures(page);
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'figma-import-build-run' });
+  await page.route('**/api/projects/*/figma/import', async (route) => {
+    importBodies.push(route.request().postData() ?? '');
+    await route.fulfill({
+      json: {
+        snapshotDir: 'figma',
+        files: ['figma/tree.json', 'figma/DESIGN-context.md', 'figma/thumbnail.png'],
+        inventory: {
+          decoded: true,
+          source: 'fig-file',
+          nodeCount: 10,
+          pageCount: 1,
+          frameCount: 2,
+          componentCount: 2,
+          colors: ['#0B5FFF'],
+          fonts: [{ family: 'Inter', styles: ['Regular'] }],
+          assetCount: 1,
+          hasThumbnail: true,
+          warnings: [],
+        },
+        thumbnailPath: 'figma/thumbnail.png',
+        contextPath: 'figma/DESIGN-context.md',
+        suggestedPrompt,
+        label: 'project-flow.fig',
+      },
+    });
+  });
+
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await createProject(page, 'Project Figma import success');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-figma').click();
+  const figmaImport = page.getByRole('dialog', { name: 'Import from Figma' });
+  await expect(figmaImport).toBeVisible();
+  await figmaImport.locator('input[type="file"]').setInputFiles({
+    name: 'project-flow.fig',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.from('fake project fig payload', 'utf8'),
+  });
+  await expect(figmaImport).toContainText('project-flow.fig');
+  await figmaImport.getByPlaceholder(/Optional: notes/i).fill('Keep the original hierarchy.');
+  await figmaImport.getByRole('button', { name: 'Import & build' }).click();
+
+  await expect.poll(() => importBodies.length, { timeout: 10_000 }).toBe(1);
+  expect(importBodies[0]).toContain('project-flow.fig');
+  expect(importBodies[0]).toContain('Keep the original hierarchy.');
+  await expect(figmaImport).toBeVisible();
+  await expect(input).toContainText(suggestedPrompt);
+  await figmaImport.getByRole('button', { name: 'Close' }).click();
+  await expect(figmaImport).toHaveCount(0);
+
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  expect(runRequestBodies[0]?.message).toContain(suggestedPrompt);
+});
+
+test('[P1] project detail Figma import keeps the dialog open and retryable on decode failure', async ({ page }) => {
+  const importBodies: string[] = [];
+
+  await routeComposerPlusFixtures(page);
+  await page.route('**/api/projects/*/figma/import', async (route) => {
+    importBodies.push(route.request().postData() ?? '');
+    await route.fulfill({
+      status: 500,
+      json: { error: { message: 'Could not decode the Figma archive.' } },
+    });
+  });
+
+  await page.goto('/');
+  await createProject(page, 'Project Figma import failure');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-figma').click();
+  const figmaImport = page.getByRole('dialog', { name: 'Import from Figma' });
+  await figmaImport.locator('input[type="file"]').setInputFiles({
+    name: 'broken-project-flow.fig',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.from('broken fig payload', 'utf8'),
+  });
+  await figmaImport.getByRole('button', { name: 'Import & build' }).click();
+
+  await expect.poll(() => importBodies.length, { timeout: 10_000 }).toBe(1);
+  await expect(figmaImport).toBeVisible();
+  await expect(figmaImport).toContainText('Could not decode the Figma archive.');
+  await expect(figmaImport.getByRole('button', { name: 'Import & build' })).toBeEnabled();
+  await expect(input).not.toContainText('figma/DESIGN-context.md');
+});
+
+test('[P1] project detail composer sends referenced workspace contexts into the run request', async ({ page }) => {
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  const referenceProject = {
+    id: 'ref-project-payload',
+    name: 'Reference Project Payload',
+    skillId: null,
+    designSystemId: null,
+    createdAt: Date.now() - 1_000,
+    updatedAt: Date.now(),
+    metadata: {
+      kind: 'prototype',
+      nameSource: 'user',
+    },
+  };
+
+  await routeComposerPlusFixtures(page);
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'workspace-context-payload-run' });
+  await page.route('**/api/projects', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: { projects: [referenceProject] } });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route('**/api/projects/ref-project-payload**', async (route) => {
+    await route.fulfill({
+      json: {
+        project: referenceProject,
+        resolvedDir: '/tmp/open-design/reference-project-payload',
+      },
+    });
+  });
+  await page.route('**/api/projects/*', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          project: {
+            id: route.request().url().split('/api/projects/')[1]?.split(/[/?#]/)[0] ?? 'project',
+            name: 'Composer workspace context payload',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: body.metadata ?? { kind: 'prototype' },
+          },
+        },
+      });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route('**/api/dialog/open-folder', async (route) => {
+    await route.fulfill({ json: { path: '/tmp/open-design/local-code-project-payload' } });
+  });
+  await page.route('**/api/dir-exists', async (route) => {
+    await route.fulfill({ json: { exists: true } });
+  });
+
+  await page.goto('/');
+  await createProject(page, 'Composer workspace context payload');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-reference-project').click();
+  const referenceDialog = page.getByRole('dialog', { name: 'Reference another project' });
+  await expect(referenceDialog.getByRole('option', { name: /Reference Project Payload/i })).toHaveAttribute('aria-selected', 'true');
+  await referenceDialog.getByRole('button', { name: 'Reference project' }).click();
+  await expect(composer.locator('.staged-context--workspace', { hasText: 'Reference Project Payload' })).toBeVisible();
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-local-code').click();
+  await expect(composer.locator('.staged-context--workspace', { hasText: 'local-code-project-payload' })).toBeVisible();
+
+  await input.fill('Use the referenced workspace contexts in this run.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  const context = runRequestBodies[0]?.context as { workspaceItems?: Array<{ id?: string; label?: string; absolutePath?: string }> } | undefined;
+  expect(context?.workspaceItems ?? []).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        id: 'project:ref-project-payload',
+        label: 'Reference Project Payload',
+        absolutePath: '/tmp/open-design/reference-project-payload',
+      }),
+      expect.objectContaining({
+        id: 'local-code:/tmp/open-design/local-code-project-payload',
+        label: 'local-code-project-payload',
+        absolutePath: '/tmp/open-design/local-code-project-payload',
+      }),
+    ]),
+  );
+});
+
+test('[P1] project detail composer removing local-code context updates metadata and the next run request', async ({ page }) => {
+  const patchRequests: Array<Record<string, unknown>> = [];
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+
+  await routeComposerPlusFixtures(page);
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'workspace-context-remove-run' });
+  await page.route('**/api/dialog/open-folder', async (route) => {
+    await route.fulfill({ json: { path: '/tmp/open-design/local-code-remove' } });
+  });
+  await page.route('**/api/dir-exists', async (route) => {
+    await route.fulfill({ json: { exists: true } });
+  });
+  await page.route('**/api/projects/*', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      patchRequests.push(body);
+      await route.fulfill({
+        json: {
+          project: {
+            id: route.request().url().split('/api/projects/')[1]?.split(/[/?#]/)[0] ?? 'project',
+            name: 'Composer remove context',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: body.metadata ?? { kind: 'prototype' },
+          },
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto('/');
+  await createProject(page, 'Composer remove context');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-local-code').click();
+  const chip = composer.locator('.staged-context--workspace', { hasText: 'local-code-remove' });
+  await expect(chip).toBeVisible();
+  await expect(input).toContainText('local-code-remove');
+
+  await chip.getByRole('button', { name: /local-code-remove/i }).click();
+  await expect(chip).toHaveCount(0);
+  await expect(input).not.toContainText('local-code-remove');
+  await expect.poll(() => patchRequests.length).toBeGreaterThanOrEqual(2);
+  expect((patchRequests.at(-1)?.metadata as { linkedDirs?: string[] } | undefined)?.linkedDirs ?? []).toEqual([]);
+
+  await input.fill('Run without the removed local code context.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  const context = runRequestBodies[0]?.context as { workspaceItems?: Array<{ label?: string; absolutePath?: string }> } | undefined;
+  expect(context?.workspaceItems ?? []).toEqual([]);
+});
+
+test('[P1] project detail keeps local-code context when linkedDirs PATCH removal fails', async ({ page }) => {
+  test.setTimeout(60_000);
+  const patchRequests: Array<Record<string, unknown>> = [];
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+
+  await routeComposerPlusFixtures(page);
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'workspace-context-remove-failure-run' });
+  await page.route('**/api/dialog/open-folder', async (route) => {
+    await route.fulfill({ json: { path: '/tmp/open-design/local-code-persist' } });
+  });
+  await page.route('**/api/dir-exists', async (route) => {
+    await route.fulfill({ json: { exists: true } });
+  });
+  await page.route('**/api/projects/*', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      patchRequests.push(body);
+      const linkedDirs = (body.metadata as { linkedDirs?: string[] } | undefined)?.linkedDirs ?? [];
+      if (linkedDirs.length === 0) {
+        await route.fulfill({
+          status: 400,
+          json: { error: { code: 'INVALID_LINKED_DIR', message: 'linked dir removal rejected' } },
+        });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          project: {
+            id: route.request().url().split('/api/projects/')[1]?.split(/[/?#]/)[0] ?? 'project',
+            name: 'Composer remove context failure',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: body.metadata ?? { kind: 'prototype' },
+          },
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await createProject(page, 'Composer remove context failure');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+  const input = page.getByTestId('chat-composer-input');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByRole('menuitem', { name: /Link local code/i }).click();
+  const chip = composer.locator('.staged-context--workspace', { hasText: 'local-code-persist' });
+  await expect(chip).toBeVisible();
+
+  await chip.getByRole('button', { name: /local-code-persist/i }).click();
+  await expect.poll(() => patchRequests.length).toBeGreaterThanOrEqual(2);
+  await expect(chip).toBeVisible();
+  await expect(input).toContainText('local-code-persist');
+
+  await input.fill('Run with the local code context after removal failed.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  const context = runRequestBodies[0]?.context as { workspaceItems?: Array<{ label?: string; absolutePath?: string }> } | undefined;
+  expect(context?.workspaceItems ?? []).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        label: 'local-code-persist',
+        absolutePath: '/tmp/open-design/local-code-persist',
+      }),
+    ]),
+  );
+});
+
+test('[P1] project detail composer context actions emit analytics event fields', async ({ page }) => {
+  const analyticsBodies: string[] = [];
+
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      json: {
+        config: {
+          mode: 'daemon',
+          apiKey: '',
+          baseUrl: 'https://api.anthropic.com',
+          model: 'claude-sonnet-4-5',
+          agentId: 'codex',
+          skillId: null,
+          designSystemId: null,
+          onboardingCompleted: true,
+          agentModels: { codex: { model: 'default', reasoning: 'default' } },
+          privacyDecisionAt: 1,
+          telemetry: { metrics: true, content: false, artifactManifest: false },
+        },
+      },
+    });
+  });
+  await page.route('**/api/analytics/config', async (route) => {
+    await route.fulfill({
+      json: {
+        enabled: true,
+        env: 'e2e',
+        key: 'phc_e2e',
+        host: 'https://analytics.open-design.test',
+        installationId: 'e2e-installation',
+      },
+    });
+  });
+  await page.route('https://analytics.open-design.test/**', async (route) => {
+    analyticsBodies.push(route.request().postData() ?? '');
+    await route.fulfill({ status: 200, json: { status: 1 } });
+  });
+  await routeComposerPlusFixtures(page);
+  await page.route('**/api/dialog/open-folder', async (route) => {
+    await route.fulfill({ json: { path: '/tmp/open-design/local-code-analytics' } });
+  });
+  await page.route('**/api/dir-exists', async (route) => {
+    await route.fulfill({ json: { exists: true } });
+  });
+  await page.route('**/api/projects/*', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          project: {
+            id: route.request().url().split('/api/projects/')[1]?.split(/[/?#]/)[0] ?? 'project',
+            name: 'Composer context analytics',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: body.metadata ?? { kind: 'prototype' },
+          },
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto('/');
+  await createProject(page, 'Composer context analytics');
+  await expectWorkspaceReady(page);
+  const composer = page.getByTestId('chat-composer');
+
+  await composer.getByTestId('chat-plus-trigger').click();
+  await page.getByTestId('composer-plus-local-code').click();
+  const chip = composer.locator('.staged-context--workspace', { hasText: 'local-code-analytics' });
+  await expect(chip).toBeVisible();
+  await chip.getByRole('button', { name: /local-code-analytics/i }).click();
+  await expect(chip).toHaveCount(0);
+
+  await expect.poll(() => analyticsBodies.join('\n')).toContain('plus_pick');
+  const raw = analyticsBodies.join('\n');
+  expect(raw).toContain('context_remove');
+  expect(raw).toContain('workspace');
+  expect(raw).toContain('local-code');
+});
+
+test('[P1] Open Design Cloud hard balance gate blocks a project send before a daemon run starts', async ({ page }) => {
+  test.setTimeout(60_000);
+
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({
+        json: {
+          config: {
+            mode: 'daemon',
+            apiKey: '',
+            baseUrl: 'https://api.anthropic.com',
+            model: 'claude-sonnet-4-5',
+            agentId: 'amr',
+            skillId: null,
+            designSystemId: null,
+            onboardingCompleted: true,
+            privacyDecisionAt: 1,
+            telemetry: { metrics: false, content: false, artifactManifest: false },
+            agentModels: {},
+            agentCliEnv: {},
+          },
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await routeAgents(page, [
+    ...AGENTS,
+    {
+      id: 'amr',
+      name: 'Open Design Cloud',
+      bin: 'amr',
+      available: true,
+      version: 'cloud',
+      models: [{ id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5' }],
+    },
+  ]);
+  await page.route('**/api/integrations/vela/wallet**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'available',
+        profile: 'local',
+        user: { id: 'amr-balance-user', email: 'blocked@example.com', plan: 'free' },
+        balanceUsd: '0.00',
+        updatedAt: '2026-07-09T00:00:00.000Z',
+        fetchedAt: '2026-07-09T00:00:00.000Z',
+        stale: false,
+        source: 'vela_api',
+      }),
+    });
+  });
+  const runRequests = await routeSuccessfulRuns(page, {
+    bodies: runRequestBodies,
+    runIdPrefix: 'should-not-start',
+    events: false,
+  });
+
+  await page.goto('/');
+  await createProject(page, 'AMR balance gate project send');
+  await expectWorkspaceReady(page);
+
+  const input = page.getByTestId('chat-composer-input');
+  await input.fill('Start a cloud run that should be blocked before the daemon run.');
+  await page.getByTestId('chat-send').click();
+
+  const dialog = page.getByTestId('amr-balance-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('$0.00');
+  await expect(dialog.getByTestId('amr-balance-dialog-plans')).toBeVisible();
+  await runRequests.expectNone({
+    message: 'AMR balance gate should block before POST /api/runs',
+  });
+  await expect(page.getByTestId('chat-queued-send-strip')).toContainText(
+    'Start a cloud run that should be blocked',
+  );
+});
+
 test('[P0] @critical project detail composer agent menu lets the user switch Local CLI agents and models', async ({ page }) => {
   test.setTimeout(60_000);
   await page.goto('/');
@@ -510,30 +1238,14 @@ test('[P0] @critical project detail composer agent menu lets the user switch Loc
   const modelSelect = menu.locator('.avatar-model-section [role=\"combobox\"]').first();
   await expect(modelSelect).toBeVisible();
   await expect(modelSelect).toContainText(/default/i);
-  await modelSelect.click();
-  await page.getByRole('option', { name: /^Sonnet \(alias\)$/i }).click();
+  await selectAvatarModelOption(page, modelSelect, /^Sonnet \(alias\)$/i);
   await expect(modelSelect).toContainText(/Sonnet/i);
 });
 
-test('[P0] project detail composer agent and model switches carry into the next daemon run request', async ({ page }) => {
+test('[P0] project detail composer agent, model, and Plan mode switches carry into the next daemon run request', async ({ page }) => {
   test.setTimeout(60_000);
   const runRequestBodies: Array<Record<string, unknown>> = [];
-  await page.route('**/api/runs', async (route) => {
-    const raw = route.request().postData();
-    if (raw) runRequestBodies.push(JSON.parse(raw) as Record<string, unknown>);
-    await route.fulfill({
-      status: 202,
-      contentType: 'application/json',
-      body: '{"runId":"agent-model-run"}',
-    });
-  });
-  await page.route('**/api/runs/*/events', async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
-      body: ['event: end', 'data: {"code":0,"status":"succeeded"}', '', ''].join('\n'),
-    });
-  });
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runId: 'agent-model-run' });
 
   await page.goto('/');
   await createProject(page, 'Composer agent switch run context');
@@ -542,12 +1254,15 @@ test('[P0] project detail composer agent and model switches carry into the next 
   const { menu, claudeButton } = await openComposerAgentMenu(page);
   await claudeButton.click();
   const modelSelect = menu.locator('.avatar-model-section [role=\"combobox\"]').first();
-  await modelSelect.click();
-  await page.getByRole('option', { name: /^Sonnet \(alias\)$/i }).click();
+  await selectAvatarModelOption(page, modelSelect, /^Sonnet \(alias\)$/i);
   await expect(modelSelect).toContainText(/Sonnet/i);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.avatar-popover[role="dialog"]')).toHaveCount(0);
+
+  await selectComposerSessionMode(page, 'Plan mode');
 
   const input = page.getByTestId('chat-composer-input');
-  await input.fill('Use the selected local agent for this run.');
+  await input.fill('Plan the selected local agent run.');
   await Promise.all([
     page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
     page.getByTestId('chat-send').click(),
@@ -556,18 +1271,126 @@ test('[P0] project detail composer agent and model switches carry into the next 
   expect(runRequestBodies.length).toBeGreaterThan(0);
   expect(runRequestBodies[0]?.agentId).toBe('claude');
   expect(runRequestBodies[0]?.model).toBe('sonnet');
+  expect(runRequestBodies[0]?.sessionMode).toBe('plan');
+});
+
+test('[P1] GPT 5.5 Fast service tier carries into the next Codex daemon run request', async ({ page }) => {
+  test.setTimeout(60_000);
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'codex-fast-tier-run' });
+
+  await page.goto('/');
+  await createProject(page, 'Codex Fast service tier contract');
+  await expectWorkspaceReady(page);
+
+  const { menu } = await openComposerAgentMenu(page);
+  const modelSelect = menu.locator('.avatar-model-section [role=\"combobox\"]').first();
+  await selectAvatarModelOption(page, modelSelect, /^GPT 5\.5$/i);
+  await expect(modelSelect).toContainText(/GPT 5\.5/i);
+
+  const serviceTierSelect = menu
+    .locator('label.avatar-select-row', { hasText: /Service tier/i })
+    .locator('select');
+  await expect(serviceTierSelect).toBeVisible();
+  await serviceTierSelect.selectOption('priority');
+  await expect(serviceTierSelect).toHaveValue('priority');
+
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.avatar-popover[role="dialog"]')).toHaveCount(0);
+
+  await page.getByTestId('chat-composer-input').fill('Use GPT 5.5 Fast for this Codex run.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  expect(runRequestBodies[0]).toMatchObject({
+    agentId: 'codex',
+    model: 'gpt-5.5',
+    serviceTier: 'priority',
+  });
+});
+
+test('[P1] project detail composer can alternate Design, Ask, and Plan modes across turns', async ({ page }) => {
+  test.setTimeout(60_000);
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'mode-run' });
+
+  await page.goto('/');
+  await createProject(page, 'Composer session mode alternation');
+  await expectWorkspaceReady(page);
+
+  async function sendTurn(prompt: string) {
+    const input = page.getByTestId('chat-composer-input');
+    await expect(input).toBeVisible();
+    await input.fill(prompt);
+    await Promise.all([
+      page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+      page.getByTestId('chat-send').click(),
+    ]);
+    await expect(page.getByTestId('chat-send')).toBeEnabled({ timeout: 15_000 });
+  }
+
+  await selectComposerSessionMode(page, 'Design mode');
+  await sendTurn('Design the first iteration.');
+
+  await selectComposerSessionMode(page, 'Ask mode');
+  await sendTurn('Ask a clarifying question about the direction.');
+
+  await selectComposerSessionMode(page, 'Plan mode');
+  await sendTurn('Plan the implementation steps.');
+
+  await selectComposerSessionMode(page, 'Design mode');
+  await sendTurn('Design the final iteration.');
+
+  expect(runRequestBodies.map((body) => body.sessionMode)).toEqual(['design', 'chat', 'plan', 'design']);
+});
+
+test('[P1] project detail composer keeps the selected mode across consecutive turns', async ({ page }) => {
+  test.setTimeout(60_000);
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'same-mode-run' });
+
+  await page.goto('/');
+  await createProject(page, 'Composer same session mode reuse');
+  await expectWorkspaceReady(page);
+
+  async function sendTurn(prompt: string) {
+    const input = page.getByTestId('chat-composer-input');
+    await expect(input).toBeVisible();
+    await input.fill(prompt);
+    await Promise.all([
+      page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+      page.getByTestId('chat-send').click(),
+    ]);
+    await expect(page.getByTestId('chat-send')).toBeEnabled({ timeout: 15_000 });
+  }
+
+  await selectComposerSessionMode(page, 'Plan mode');
+  await sendTurn('Plan the first pass.');
+  await sendTurn('Plan the second pass without changing mode.');
+
+  expect(runRequestBodies.map((body) => body.sessionMode)).toEqual(['plan', 'plan']);
+  await expect(page.getByTestId('chat-composer').getByTestId('session-mode-trigger')).toHaveAttribute(
+    'aria-label',
+    'Plan mode',
+  );
 });
 
 test('[P0] @critical project detail composer BYOK model switch persists from the agent menu', async ({ page }) => {
   test.setTimeout(60_000);
   const config = {
     mode: 'daemon',
-    apiKey: 'sk-openai-test',
+    apiKey: '',
     apiProtocol: 'openai',
     apiVersion: '',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-2024-05-13',
     apiProviderBaseUrl: 'https://api.openai.com/v1',
+    byokProfileId: 'byok-project-model-switch',
+    byokCredentialConfigured: true,
+    byokCredentialTail: 'test',
     agentId: 'codex',
     skillId: null,
     designSystemId: null,
@@ -601,6 +1424,7 @@ test('[P0] @critical project detail composer BYOK model switch persists from the
       body: JSON.stringify({ config }),
     });
   });
+  await routeByokProfile(page, config);
 
   await page.goto('/');
   await createProject(page, 'Composer BYOK model switch');
@@ -632,12 +1456,15 @@ test('[P0] @critical project detail composer keeps Local CLI and BYOK model choi
   test.setTimeout(60_000);
   const config = {
     mode: 'daemon',
-    apiKey: 'sk-openai-test',
+    apiKey: '',
     apiProtocol: 'openai',
     apiVersion: '',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-2024-05-13',
     apiProviderBaseUrl: 'https://api.openai.com/v1',
+    byokProfileId: 'byok-project-model-isolation',
+    byokCredentialConfigured: true,
+    byokCredentialTail: 'test',
     agentId: 'codex',
     skillId: null,
     designSystemId: null,
@@ -671,6 +1498,7 @@ test('[P0] @critical project detail composer keeps Local CLI and BYOK model choi
       body: JSON.stringify({ config }),
     });
   });
+  await routeByokProfile(page, config);
 
   await page.goto('/');
   await createProject(page, 'Composer model mode isolation');
@@ -679,8 +1507,7 @@ test('[P0] @critical project detail composer keeps Local CLI and BYOK model choi
   const { menu, claudeButton } = await openComposerAgentMenu(page);
   await claudeButton.click();
   const localModelSelect = menu.locator('.avatar-model-section [role="combobox"]').first();
-  await localModelSelect.click();
-  await page.getByRole('option', { name: /^Sonnet \(alias\)$/i }).click();
+  await selectAvatarModelOption(page, localModelSelect, /^Sonnet \(alias\)$/i);
   await expect(localModelSelect).toContainText(/Sonnet/i);
 
   await menu.getByRole('button', { name: /API · BYOK|Use API/i }).click();
@@ -721,22 +1548,7 @@ test('[P0] clearing the project design system removes designSystemId from the ne
     patchBodies.push(body);
     await route.continue();
   });
-  await page.route('**/api/runs', async (route) => {
-    const raw = route.request().postData();
-    if (raw) runRequestBodies.push(JSON.parse(raw) as Record<string, unknown>);
-    await route.fulfill({
-      status: 202,
-      contentType: 'application/json',
-      body: '{"runId":"design-system-clear-run"}',
-    });
-  });
-  await page.route('**/api/runs/*/events', async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
-      body: ['event: end', 'data: {"code":0,"status":"succeeded"}', '', ''].join('\n'),
-    });
-  });
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runId: 'design-system-clear-run' });
 
   await page.goto('/');
   await createProject(page, 'Header design system clear run context');
@@ -764,6 +1576,63 @@ test('[P0] clearing the project design system removes designSystemId from the ne
   ]);
 
   expect(runRequestBodies.length).toBeGreaterThan(0);
+  expect(runRequestBodies[0]?.designSystemId).toBeNull();
+});
+
+test('[P1] a disabled project design system is omitted from the next run request', async ({ page }) => {
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await page.route('**/api/design-systems', async (route) => {
+    await route.fulfill({ json: { designSystems: DESIGN_SYSTEMS } });
+  });
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({
+        json: {
+          config: {
+            onboardingCompleted: true,
+            agentId: 'codex',
+            designSystemId: null,
+            disabledDesignSystems: ['editorial-noir'],
+            agentModels: { codex: { model: 'default' } },
+            privacyDecisionAt: 1,
+            telemetry: { metrics: false, content: false, artifactManifest: false },
+          },
+        },
+      });
+      return;
+    }
+    await route.fallback();
+  });
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runId: 'disabled-design-system-run' });
+
+  await createProject(page, 'Disabled project design system');
+  await expectWorkspaceReady(page);
+  const projectId = getProjectContextFromUrl(page).projectId;
+  const projectResponse = await page.request.get(`/api/projects/${projectId}`);
+  expect(projectResponse.ok(), await projectResponse.text()).toBeTruthy();
+  const projectPayload = (await projectResponse.json()) as { project: Record<string, unknown> };
+  const disabledProject = {
+    ...projectPayload.project,
+    designSystemId: 'editorial-noir',
+  };
+  await page.route(`**/api/projects/${projectId}`, async (route) => {
+    if (route.request().method() === 'GET' || route.request().method() === 'PATCH') {
+      await route.fulfill({ json: { project: disabledProject } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.reload();
+  await expectWorkspaceReady(page);
+
+  const input = page.getByTestId('chat-composer-input');
+  await input.fill('Generate without the disabled design system.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  expect(runRequestBodies).toHaveLength(1);
   expect(runRequestBodies[0]?.designSystemId).toBeNull();
 });
 
@@ -819,8 +1688,78 @@ test('[P2] project header keeps the settings, handoff, and avatar controls pinne
 
   expect(layout.overflow).toBeLessThanOrEqual(2);
   expect(layout.handoffRight).toBeGreaterThan(layout.titleRight);
-  expect(layout.avatarRight).toBeGreaterThan(layout.handoffRight);
+  expect(layout.handoffRight).toBeLessThanOrEqual(layout.viewportWidth - 8);
+  expect(layout.avatarRight).toBeGreaterThan(0);
   expect(layout.avatarRight).toBeLessThanOrEqual(layout.viewportWidth - 8);
+});
+
+test('[P1] project handoff AMR website link carries attribution from the CLI tab', async ({ page }) => {
+  await routeHandoffEditors(page);
+  await page.goto('/');
+  await createProject(page, 'Handoff AMR attribution');
+  await expectWorkspaceReady(page);
+
+  const menu = await openHandoffCliTab(page);
+  const amrLink = menu.locator('.handoff-amr-link');
+  await expect(amrLink).toBeVisible();
+  await expect(amrLink).toHaveAttribute('target', '_blank');
+  await expect(amrLink).toHaveAttribute('rel', 'noreferrer');
+
+  await amrLink.evaluate((link) => {
+    link.addEventListener('click', (event) => event.preventDefault(), { once: true });
+  });
+  await amrLink.click();
+  const href = await amrLink.getAttribute('href');
+  expect(href).toBeTruthy();
+  const url = new URL(href!);
+
+  expect(url.searchParams.get('od_origin')).toBe('open_design');
+  expect(url.searchParams.get('od_entry_source')).toBe('handoff_amr_website');
+  expect(url.searchParams.get('od_entry_id')).toBeTruthy();
+});
+
+test('[P1] project handoff CLI prompt copies the project path, framework, id, and target agent', async ({ page }) => {
+  await page.addInitScript(() => {
+    const store: string[] = [];
+    Object.defineProperty(window, '__copiedTexts', {
+      value: store,
+      configurable: true,
+    });
+    Object.defineProperty(navigator, 'clipboard', {
+      value: {
+        writeText(text: string) {
+          store.push(text);
+          return Promise.resolve();
+        },
+      },
+      configurable: true,
+    });
+  });
+  await routeHandoffEditors(page);
+  await page.goto('/');
+  await createProject(page, 'Handoff CLI prompt contract');
+  await expectWorkspaceReady(page);
+  const { projectId } = getProjectContextFromUrl(page);
+
+  const menu = await openHandoffCliTab(page);
+  const pathButton = menu.locator('.handoff-path-button');
+  await expect(pathButton).toBeEnabled();
+  const projectDir = await pathButton.getAttribute('title');
+  expect(projectDir).toBeTruthy();
+
+  await menu.getByRole('button', { name: /^Next\.js$/ }).click();
+  await menu.getByTestId('handoff-cli-item-codex').click();
+  await expect(menu.getByTestId('handoff-cli-item-codex')).toContainText('Copied');
+
+  const copied = await page.evaluate(() => {
+    return (window as typeof window & { __copiedTexts?: string[] }).__copiedTexts ?? [];
+  });
+  const prompt = copied.at(-1) ?? '';
+  expect(prompt).toContain(projectDir as string);
+  expect(prompt).toContain('cd ');
+  expect(prompt).toContain('Target: Next.js / React');
+  expect(prompt).toContain('CLI: Codex CLI (codex)');
+  expect(prompt).toContain(`Project ID: ${projectId}`);
 });
 
 test('[P1] canceling design file deletion keeps the file and open tab', async ({ page }) => {
@@ -836,7 +1775,7 @@ test('[P1] canceling design file deletion keeps the file and open tab', async ({
     expect(dialog.message()).toContain('delete-cancel.png');
     await dialog.dismiss();
   });
-  await page.getByTestId('design-files-tab').click();
+  await openAllProjectFiles(page);
   await rowByFileName(page, uploadedName).hover();
   await menuByFileName(page, uploadedName).click();
   await page.getByTestId(`design-file-delete-${uploadedName}`).click();
@@ -854,32 +1793,469 @@ test('[P1] project detail workspace keeps design file tabs and preview controls 
   await createProject(page, 'Workspace preview structure');
   await expectWorkspaceReady(page);
 
-  const uploadedName = await uploadTinyHtml(page, 'workspace-preview.html', '<!doctype html><html><body><main><h1>Workspace Preview Structure</h1><p>Preview and code tabs stay visible.</p></main></body></html>');
+  const uploadedName = await uploadTinyHtml(page, 'workspace-preview.html', '<!doctype html><html><body><main><h1>Workspace Preview Structure</h1><p>Preview stays visible.</p></main></body></html>');
 
   const fileTab = tabBySuffix(page, uploadedName);
   await expect(fileTab).toBeVisible();
   await expect(fileTab).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('tab', { name: 'Design Files' })).toBeVisible();
+  await expect(page.getByTestId('workspace-pages-menu-trigger')).toBeVisible();
 
   await openUploadedHtmlArtifactPreview(page, uploadedName);
 
-  const viewModeTabs = page.getByRole('tablist', { name: 'View mode' });
-  await expect(viewModeTabs.getByRole('tab', { name: 'Preview' })).toBeVisible();
-  await expect(viewModeTabs.getByRole('tab', { name: 'Code' })).toBeVisible();
+  await expect(page.getByRole('tablist', { name: 'View mode' })).toHaveCount(0);
   await expect(artifactPreview(page)).toBeVisible();
   await expect(
     artifactPreviewFrame(page).getByRole('heading', { name: 'Workspace Preview Structure' }),
   ).toBeVisible();
   await expect(page.getByRole('button', { name: /Preview viewport/i })).toBeVisible();
+  await expect(page.locator('pre.viewer-source')).toHaveCount(0);
+});
 
-  await viewModeTabs.getByRole('tab', { name: 'Code' }).click();
-  const sourceViewer = page.locator('pre.viewer-source');
-  await expect(sourceViewer).toBeVisible();
-  await expect(sourceViewer).toContainText('Workspace Preview Structure');
-  await expect(sourceViewer).toContainText('<!doctype html>');
+test('[P1] project detail session mode switch carries Ask and Plan semantics into daemon runs', async ({ page }) => {
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'session-mode-run' });
 
-  await viewModeTabs.getByRole('tab', { name: 'Preview' }).click();
-  await expect(artifactPreview(page)).toBeVisible();
+  await page.goto('/');
+  await createProject(page, 'Project session mode contract');
+  await expectWorkspaceReady(page);
+
+  const modeTrigger = page.getByTestId('session-mode-trigger');
+  await expect(modeTrigger).toHaveAttribute('aria-label', 'Design mode');
+  await expect(modeTrigger).toContainText('Design');
+
+  await modeTrigger.click();
+  await page.getByRole('menuitemradio', { name: 'Plan mode' }).click();
+  await expect(modeTrigger).toHaveAttribute('aria-label', 'Plan mode');
+  await expect(modeTrigger).toContainText('Plan');
+
+  await page.getByTestId('chat-composer-input').fill('Draft the plan before generating files.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  expect(runRequestBodies[0]?.sessionMode).toBe('plan');
+  await expect(page.getByTestId('msg-session-mode-chip').last()).toContainText('Plan');
+
+  await modeTrigger.click();
+  await page.getByRole('menuitemradio', { name: 'Ask mode' }).click();
+  await expect(modeTrigger).toHaveAttribute('aria-label', 'Ask mode');
+  await expect(modeTrigger).toContainText('Ask');
+
+  await page.getByTestId('chat-composer-input').fill('Just answer this without creating files.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+  await expect.poll(() => runRequestBodies.length).toBe(2);
+  expect(runRequestBodies[1]?.sessionMode).toBe('chat');
+  await expect(page.getByTestId('msg-session-mode-chip').last()).toContainText('Ask');
+});
+
+test('[P1] BYOK OpenCode project run sends provider config through the daemon contract', async ({ page }) => {
+  const byokConfig = {
+    mode: 'api',
+    apiKey: 'sk-openai-e2e',
+    apiProtocol: 'openai',
+    apiVersion: '',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    apiProviderBaseUrl: 'https://api.openai.com/v1',
+    agentId: null,
+    skillId: null,
+    designSystemId: null,
+    onboardingCompleted: true,
+    privacyDecisionAt: 1,
+    telemetry: { metrics: false, content: false, artifactManifest: false },
+    agentModels: {},
+    agentCliEnv: {},
+  };
+  await page.addInitScript(
+    ({ key, value }) => {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    },
+    { key: STORAGE_KEY, value: byokConfig },
+  );
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({ json: { config: byokConfig } });
+  });
+  await routeAgents(page, [
+    ...AGENTS,
+    {
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: true,
+      version: '0.12.0',
+      models: [{ id: 'default', label: 'Default' }],
+    },
+  ]);
+  await page.route('**/api/memory/extract', async (route) => {
+    await route.fulfill({ json: { ok: true, extracted: [] } });
+  });
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'byok-opencode-run' });
+
+  await page.goto('/');
+  await createProject(page, 'BYOK OpenCode daemon contract');
+  await expectWorkspaceReady(page);
+
+  const input = page.getByTestId('chat-composer-input');
+  await input.fill('Create a landing page with the configured BYOK provider.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  expect(runRequestBodies[0]).toMatchObject({
+    agentId: 'byok-opencode',
+    model: 'gpt-4o-mini',
+    byokProvider: {
+      protocol: 'openai',
+      apiKey: 'sk-openai-e2e',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini',
+      apiVersion: '',
+    },
+    analyticsHints: {
+      runtimeType: 'byok',
+    },
+  });
+});
+
+test('[P1] BYOK OpenCode keyless vLLM run keeps auth fields out of the daemon contract', async ({ page }) => {
+  const byokConfig = {
+    mode: 'api',
+    apiKey: '',
+    apiProtocol: 'openai',
+    apiVersion: '',
+    baseUrl: 'http://127.0.0.1:8000/v1',
+    model: 'model',
+    apiProviderBaseUrl: 'http://127.0.0.1:8000/v1',
+    agentId: null,
+    skillId: null,
+    designSystemId: null,
+    onboardingCompleted: true,
+    privacyDecisionAt: 1,
+    telemetry: { metrics: false, content: false, artifactManifest: false },
+    agentModels: {},
+    agentCliEnv: {},
+  };
+  await page.addInitScript(
+    ({ key, value }) => {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    },
+    { key: STORAGE_KEY, value: byokConfig },
+  );
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({ json: { config: byokConfig } });
+  });
+  await routeAgents(page, [
+    ...AGENTS,
+    {
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: true,
+      version: '0.12.0',
+      models: [{ id: 'default', label: 'Default' }],
+    },
+  ]);
+  await page.route('**/api/memory/extract', async (route) => {
+    await route.fulfill({ json: { ok: true, extracted: [] } });
+  });
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'byok-opencode-keyless-run' });
+
+  await page.goto('/');
+  await createProject(page, 'BYOK OpenCode keyless vLLM contract');
+  await expectWorkspaceReady(page);
+
+  await page.getByTestId('chat-composer-input').fill('Use the local vLLM BYOK endpoint.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  expect(runRequestBodies[0]).toMatchObject({
+    agentId: 'byok-opencode',
+    model: 'model',
+    byokProvider: {
+      protocol: 'openai',
+      apiKey: '',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      model: 'model',
+      apiVersion: '',
+      requiresApiKey: false,
+    },
+    analyticsHints: {
+      runtimeType: 'byok',
+    },
+  });
+});
+
+test('[P1] BYOK OpenCode unavailable blocks the project run before daemon routing', async ({ page }) => {
+  const byokConfig = {
+    mode: 'api',
+    apiKey: 'sk-openai-e2e',
+    apiProtocol: 'openai',
+    apiVersion: '',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    apiProviderBaseUrl: 'https://api.openai.com/v1',
+    agentId: null,
+    skillId: null,
+    designSystemId: null,
+    onboardingCompleted: true,
+    privacyDecisionAt: 1,
+    telemetry: { metrics: false, content: false, artifactManifest: false },
+    agentModels: {},
+    agentCliEnv: {},
+  };
+  await page.addInitScript(
+    ({ key, value }) => {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    },
+    { key: STORAGE_KEY, value: byokConfig },
+  );
+  await page.route('**/api/app-config', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({ json: { config: byokConfig } });
+  });
+  await routeAgents(page, [
+    ...AGENTS,
+    {
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: false,
+      version: null,
+      models: [],
+    },
+  ]);
+
+  const runRequests = await routeSuccessfulRuns(page, {
+    runIdPrefix: 'byok-opencode-unavailable-should-not-start',
+    events: false,
+  });
+
+  await page.goto('/');
+  await createProject(page, 'BYOK OpenCode unavailable contract');
+  await expectWorkspaceReady(page);
+
+  const input = page.getByTestId('chat-composer-input');
+  await input.fill('Create a landing page with unavailable OpenCode.');
+  await page.getByTestId('chat-send').click();
+
+  await expect(page.locator('.run-error__description')).toContainText(
+    /BYOK API runs require OpenCode/i,
+  );
+  await runRequests.expectNone({
+    message: 'unavailable BYOK OpenCode should fail preflight before POST /api/runs',
+  });
+});
+
+test('[P1] project detail active file context is sent with the run and shown on the user message', async ({ page }) => {
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'workspace-context-run' });
+
+  await page.goto('/');
+  await createProject(page, 'Workspace context chip contract');
+  await expectWorkspaceReady(page);
+
+  const uploadedName = await uploadTinyHtml(
+    page,
+    'workspace-context.html',
+    '<!doctype html><html><body><main><h1>Workspace Context</h1></main></body></html>',
+  );
+  await expect(tabBySuffix(page, uploadedName)).toHaveAttribute('aria-selected', 'true');
+
+  await page.getByTestId('chat-composer-input').fill('Use the currently open file as context.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  const context = runRequestBodies[0]?.context as { workspaceItems?: Array<{ label?: string; id?: string }> } | undefined;
+  expect(context?.workspaceItems?.some((item) => item.label === uploadedName || item.id?.includes(uploadedName))).toBe(true);
+  const chip = page.getByTestId('msg-workspace-context-chip').last();
+  await expect(chip).toBeVisible();
+  await expect(chip).toContainText(uploadedName);
+});
+
+test('[P1] project detail session mode and active file context survive reload in message history', async ({ page }) => {
+  const runRequestBodies: Array<Record<string, unknown>> = [];
+  await routeSuccessfulRuns(page, { bodies: runRequestBodies, runIdPrefix: 'workspace-context-reload-run' });
+
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await createProject(page, 'Workspace context reload contract');
+  await expectWorkspaceReady(page);
+
+  const uploadedName = await uploadTinyHtml(
+    page,
+    'workspace-context-reload.html',
+    '<!doctype html><html><body><main><h1>Workspace Context Reload</h1></main></body></html>',
+  );
+  await expect(tabBySuffix(page, uploadedName)).toHaveAttribute('aria-selected', 'true');
+
+  const modeTrigger = page.getByTestId('session-mode-trigger');
+  await modeTrigger.click();
+  await page.getByRole('menuitemradio', { name: 'Plan mode' }).click();
+  await expect(modeTrigger).toHaveAttribute('aria-label', 'Plan mode');
+
+  await page.getByTestId('chat-composer-input').fill('Persist this file context through reload.');
+  await Promise.all([
+    page.waitForRequest((request) => request.url().includes('/api/runs') && request.method() === 'POST'),
+    page.getByTestId('chat-send').click(),
+  ]);
+
+  await expect.poll(() => runRequestBodies.length).toBe(1);
+  const context = runRequestBodies[0]?.context as { workspaceItems?: Array<{ label?: string; id?: string }> } | undefined;
+  expect(runRequestBodies[0]?.sessionMode).toBe('plan');
+  expect(context?.workspaceItems?.some((item) => item.label === uploadedName || item.id?.includes(uploadedName))).toBe(true);
+  await expect(page.getByTestId('msg-session-mode-chip').last()).toContainText('Plan');
+  await expect(page.getByTestId('msg-workspace-context-chip').last()).toContainText(uploadedName);
+
+  await page.reload();
+  await expectWorkspaceReady(page);
+  await expect(page.getByTestId('msg-session-mode-chip').last()).toContainText('Plan');
+  await expect(page.getByTestId('msg-workspace-context-chip').last()).toContainText(uploadedName);
+});
+
+test('[P1] active project API defaults to the selected project file from the real workspace', async ({ page }) => {
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await createProject(page, 'MCP active context contract');
+  await expectWorkspaceReady(page);
+
+  const uploadedName = await uploadTinyHtml(
+    page,
+    'mcp-active-context.html',
+    '<!doctype html><html><body><main><h1>MCP Active Context</h1></main></body></html>',
+  );
+  const { projectId } = getProjectContextFromUrl(page);
+  await expect(tabBySuffix(page, uploadedName)).toHaveAttribute('aria-selected', 'true');
+  await expect
+    .poll(async () => {
+      const response = await page.request.get('/api/active');
+      const body = (await response.json()) as { projectId?: string; fileName?: string };
+      return `${body.projectId ?? ''}:${body.fileName ?? ''}`;
+    })
+    .toBe(`${projectId}:${uploadedName}`);
+});
+
+test('[P1] project detail HTML version manager previews and restores an older snapshot', async ({ page }) => {
+  const restoredRequests: string[] = [];
+
+  await page.goto('/');
+  await createProject(page, 'HTML version manager contract');
+  await expectWorkspaceReady(page);
+
+  const uploadedName = await uploadTinyHtml(
+    page,
+    'version-manager.html',
+    '<!doctype html><html><body><main><h1>Current Version</h1></main></body></html>',
+  );
+  const { projectId } = getProjectContextFromUrl(page);
+  const now = Date.now();
+  const currentVersion = {
+    id: 'v-current',
+    fileName: uploadedName,
+    version: 2,
+    label: 'Current generated HTML',
+    createdAt: now,
+    source: 'ai',
+    prompt: 'Current generated HTML',
+    promptSource: 'message',
+    size: 82,
+    mime: 'text/html',
+    kind: 'html',
+    current: true,
+  };
+  const oldVersion = {
+    id: 'v-old',
+    fileName: uploadedName,
+    version: 1,
+    label: 'Initial generated HTML',
+    createdAt: now - 60_000,
+    source: 'manual',
+    prompt: 'Initial generated HTML',
+    promptSource: 'manual',
+    size: 78,
+    mime: 'text/html',
+    kind: 'html',
+    current: false,
+  };
+  const restoredVersion = {
+    ...oldVersion,
+    id: 'v-restored',
+    version: 3,
+    source: 'restore',
+    current: true,
+    restoreFromVersionId: oldVersion.id,
+  };
+  const oldVersionContent = '<!doctype html><html><body><main><h1>Initial Version</h1></main></body></html>';
+  const restoredContent = '<!doctype html><html><body><main><h1>Restored Version</h1></main></body></html>';
+
+  await page.route(`**/api/projects/${projectId}/files/${uploadedName}/versions`, async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({
+        json: {
+          file: { name: uploadedName, kind: 'html', mime: 'text/html', size: oldVersionContent.length, mtime: now },
+          versions: [currentVersion, oldVersion],
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(`**/api/projects/${projectId}/files/${uploadedName}/versions/v-old`, async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ json: { version: oldVersion, content: oldVersionContent } });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(`**/api/projects/${projectId}/files/${uploadedName}/versions/v-old/restore`, async (route) => {
+    if (route.request().method() === 'POST') {
+      restoredRequests.push(route.request().url());
+      await route.fulfill({
+        json: {
+          file: { name: uploadedName, kind: 'html', mime: 'text/html', size: restoredContent.length, mtime: Date.now() },
+          version: restoredVersion,
+        },
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await openUploadedHtmlArtifactPreview(page, uploadedName);
+  await page.getByRole('button', { name: 'Versions' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Versions' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('option', { name: /Current generated HTML/i })).toHaveAttribute('aria-selected', 'true');
+
+  await dialog.getByRole('option', { name: /Initial generated HTML/i }).click();
+  await expect(dialog.locator('iframe').first().contentFrame().getByRole('heading', { name: 'Initial Version' })).toBeVisible();
+
+  await dialog.getByRole('button', { name: 'Switch to this version' }).click();
+  await dialog.getByRole('dialog', { name: 'Switch to this version?' }).getByRole('button', { name: 'Switch' }).click();
+  await expect.poll(() => restoredRequests.length).toBe(1);
+  await expect(dialog).toHaveCount(0);
 });
 
 test('[P1] project detail assistant completion actions support copy, fork, and feedback', async ({ page }) => {
@@ -1126,7 +2502,9 @@ test('[P0] @critical project detail share menu publish action opens the deploy f
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('heading', { name: /Deploy to Vercel/i })).toBeVisible();
   await expect(dialog.locator('select').first()).toHaveValue('vercel-self');
-  expect(deployConfigUrl).toContain('providerId=vercel-self');
+  await expect
+    .poll(() => deployConfigUrl ?? '', { timeout: T.medium })
+    .toContain('providerId=vercel-self');
 });
 
 test('[P1] home design card deletion supports cancel and confirm flows', async ({ page }) => {
@@ -1278,7 +2656,7 @@ test('[P2] projects sub tabs switch between Recent and Your designs ordering', a
     await route.fulfill({ json: { liveArtifacts: [] } });
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expectDesignsView(page);
 
@@ -1434,7 +2812,7 @@ test('[P2] projects page shows the empty state when there are no projects', asyn
     await route.continue();
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expect(page).toHaveURL(/\/projects$/);
   await expect(page.locator('.tab-empty')).toBeVisible();
@@ -1464,7 +2842,7 @@ test('[P2] projects page shows the no-results state and recovers when search is 
     await route.fulfill({ json: { liveArtifacts: [] } });
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expectDesignsView(page);
   await expect(homeDesignCard(page, 'Searchable Prototype')).toBeVisible();
@@ -1500,7 +2878,7 @@ test('[P2] projects grid overflow menu closes on outside click and Escape', asyn
     await route.fulfill({ json: { liveArtifacts: [] } });
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expectDesignsView(page);
 
@@ -1571,7 +2949,7 @@ test('[P2] projects kanban view groups cards into status columns', async ({ page
     await route.fulfill({ json: { liveArtifacts: [] } });
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expectDesignsView(page);
   await page.getByTestId('designs-view-kanban').click();
@@ -1582,7 +2960,15 @@ test('[P2] projects kanban view groups cards into status columns', async ({ page
   await expect(page.locator('.design-kanban-card.status-awaiting_input')).toHaveCount(1);
   await expect(page.locator('.design-kanban-card.status-succeeded')).toHaveCount(1);
   await expect(page.locator('.design-kanban-card.status-failed')).toHaveCount(1);
-  await expect(page.locator('.design-kanban-empty')).toHaveCount(1);
+  const kanbanColumns = page.locator('.design-kanban-col');
+  await expect(kanbanColumns).toHaveCount(7);
+  await expect(
+    kanbanColumns.filter({ hasText: 'Incomplete' }).locator('.design-kanban-empty'),
+  ).toHaveCount(1);
+  await expect(
+    kanbanColumns.filter({ hasText: 'Canceled' }).locator('.design-kanban-empty'),
+  ).toHaveCount(1);
+  await expect(page.locator('.design-kanban-empty')).toHaveCount(2);
 
   await expect(page.locator('.design-kanban-card.status-running')).toContainText('Running Card');
   await expect(page.locator('.design-kanban-card.status-awaiting_input')).toContainText(
@@ -1662,7 +3048,7 @@ test('[P1] projects page shows live artifact cards, supports search, and opens t
     });
   });
 
-  await stubDesignSystemsEmpty(page);
+  await stubCatalogsEmpty(page);
   await page.goto('/projects');
   await expectDesignsView(page);
 
@@ -1836,7 +3222,7 @@ type ConversationHistoryFixture = {
   id: string;
   projectId: string;
   title: string | null;
-  sessionMode: 'design' | 'ask';
+  sessionMode: 'design' | 'ask' | 'plan';
   messageCount: number;
   createdAt: number;
   updatedAt: number;
@@ -1969,11 +3355,7 @@ function conversationIdFromMessagesApiPath(url: string): string {
 }
 
 async function openNewProjectPanel(page: Page) {
-  if (await page.getByTestId('new-project-panel').isVisible()) return;
-  await ensureRailOpen(page);
-  await page.getByTestId('entry-nav-new-project').click();
-  await expect(page.getByTestId('new-project-modal')).toBeVisible();
-  await expect(page.getByTestId('new-project-panel')).toBeVisible();
+  await openNewProjectModal(page);
 }
 
 async function expectDesignsView(page: Page) {
@@ -1986,13 +3368,22 @@ async function expectDesignsView(page: Page) {
 }
 
 async function openEntrySettingsDialog(page: Page, sectionName?: RegExp | string): Promise<Locator> {
-  const settingsButton = page.getByRole('button', { name: /open settings/i });
+  const settingsButton = page
+    .getByTestId('entry-settings-menu-trigger')
+    .or(page.getByRole('button', { name: /open settings/i }))
+    .first();
   await settingsButton.click();
   let settingsDialog = page.getByRole('dialog');
   if (!(await settingsDialog.isVisible().catch(() => false))) {
-    const settingsMenu = page.locator('.avatar-popover[role="menu"]');
+    const settingsMenu = page
+      .getByTestId('entry-settings-menu')
+      .or(page.locator('.avatar-popover[role="menu"]'))
+      .first();
     await expect(settingsMenu).toBeVisible();
-    await settingsMenu.getByRole('button', { name: /^Settings$/i }).click();
+    await settingsMenu
+      .getByTestId('entry-settings-open-details')
+      .or(settingsMenu.getByRole('button', { name: /^Settings$/i }))
+      .click();
     settingsDialog = page.getByRole('dialog');
   }
   await expect(settingsDialog).toBeVisible();
@@ -2029,6 +3420,36 @@ async function openComposerAgentMenu(page: Page): Promise<{
   }
   await expect(claudeButton).toBeVisible({ timeout: 20_000 });
   return { menu, claudeButton };
+}
+
+async function selectAvatarModelOption(
+  page: Page,
+  modelSelect: Locator,
+  optionName: RegExp,
+) {
+  await expect(modelSelect).toBeVisible();
+  const option = page.getByRole('option', { name: optionName });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await modelSelect.click();
+    if (await option.isVisible({ timeout: 2_000 }).catch(() => false)) break;
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+  await expect(option).toBeVisible({ timeout: 10_000 });
+  await option.click();
+}
+
+async function selectComposerSessionMode(page: Page, modeTitle: 'Ask mode' | 'Plan mode' | 'Design mode') {
+  const trigger = page.getByTestId('chat-composer').getByTestId('session-mode-trigger');
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+
+  const menu = page.locator('.session-mode-toggle__menu[role="menu"]');
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole('menuitemradio', { name: 'Ask mode' })).toBeVisible();
+  await expect(menu.getByRole('menuitemradio', { name: 'Plan mode' })).toBeVisible();
+  await expect(menu.getByRole('menuitemradio', { name: 'Design mode' })).toBeVisible();
+  await menu.getByRole('menuitemradio', { name: modeTitle }).click();
+  await expect(trigger).toHaveAttribute('aria-label', modeTitle);
 }
 
 async function routeComposerPlusFixtures(page: Page) {
@@ -2083,11 +3504,50 @@ async function routeComposerPlusFixtures(page: Page) {
 
 async function expectWorkspaceReady(page: Page) {
   await expect(page).toHaveURL(/\/projects\//);
+  await page.getByText('Loading Open Design…').waitFor({ state: 'hidden', timeout: T.long }).catch(() => {});
   await dismissPrivacyDialog(page);
   await expect(page.getByTestId('project-title')).toBeVisible();
   await expect(page.getByTestId('chat-composer')).toBeVisible();
   await expect(page.getByTestId('chat-composer-input')).toBeVisible();
+  await expect(page.locator('.chat-loading-state')).toHaveCount(0, { timeout: T.medium });
   await expect(page.getByTestId('file-workspace')).toBeVisible();
+}
+
+async function routeHandoffEditors(page: Page): Promise<void> {
+  await page.route('**/api/editors', async (route) => {
+    await route.fulfill({
+      json: {
+        platform: 'darwin',
+        editors: [
+          {
+            id: 'cursor',
+            label: 'Cursor',
+            icon: 'cursor',
+            available: true,
+            resolvedPath: '/Applications/Cursor.app',
+            platforms: ['darwin', 'win32', 'linux'],
+          },
+          {
+            id: 'finder',
+            label: 'Finder',
+            icon: 'finder',
+            available: true,
+            resolvedPath: '/System/Library/CoreServices/Finder.app',
+            platforms: ['darwin'],
+          },
+        ],
+      },
+    });
+  });
+}
+
+async function openHandoffCliTab(page: Page): Promise<Locator> {
+  await page.getByTestId('handoff-caret').click();
+  const menu = page.getByTestId('handoff-menu');
+  await expect(menu).toBeVisible();
+  await menu.getByRole('tab', { name: /^Copy for CLI$/ }).click();
+  await expect(menu.locator('.handoff-amr-link')).toBeVisible();
+  return menu;
 }
 
 async function dismissPrivacyDialog(page: Page) {
@@ -2158,7 +3618,7 @@ async function uploadTinyPng(
 }
 
 async function openUploadedHtmlArtifactPreview(page: Page, uploadedName: string) {
-  await page.getByTestId('design-files-tab').click();
+  await openAllProjectFiles(page);
   const fileRow = rowByFileName(page, uploadedName);
   await expect(fileRow).toBeVisible();
   await fileRow.getByRole('button').first().click();
