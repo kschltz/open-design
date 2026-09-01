@@ -354,6 +354,28 @@ describe('composeSystemPrompt', () => {
     expect(prompt).toContain('no dark-on-dark labels');
   });
 
+  it('ships new Agent decks with OD Deck Protocol v1', () => {
+    const prompt = composeSystemPrompt({ skillMode: 'deck' });
+
+    expect(prompt).toContain('data-od-deck-protocol="1"');
+    expect(prompt).toContain("type: 'od:deck-ready'");
+    expect(prompt).toContain("data.type !== 'od:slide'");
+    expect(prompt).toContain('go(target);');
+    expect(prompt).toContain("type: 'od:slide-state'");
+    expect(prompt).toContain('## Final handoff — filesystem');
+    expect(prompt).toMatch(/Summarize the written or changed deck file/i);
+  });
+
+  it('ships plain API decks through a final text artifact instead of a file summary', () => {
+    const prompt = composeSystemPrompt({ skillMode: 'deck', streamFormat: 'plain' });
+
+    expect(prompt).toContain('data-od-deck-protocol="1"');
+    expect(prompt).toContain('## Final handoff — text artifact');
+    expect(prompt).toContain('MUST contain exactly one `<artifact type="text/html">...</artifact>` block');
+    expect(prompt).not.toContain('## Final handoff — filesystem');
+    expect(prompt).not.toContain('summarize the written or changed deck file');
+  });
+
   it('injects nested-diagram discipline only through deck surfaces', () => {
     const heading = '## Nested / concentric diagram discipline';
 
@@ -410,14 +432,15 @@ describe('composeSystemPrompt', () => {
       expect(claudePrompt).toContain('`--model flux-pro-ultra`');
     });
 
-    it('keeps image completion copy generic while retaining internal diagnostics', () => {
+    it('keeps image completion copy concrete while retaining internal diagnostics', () => {
       const imagePrompt = composeSystemPrompt({
         agentId: 'amr',
         locale: 'zh-CN',
         metadata: { kind: 'image', imageModel: 'vela/gpt-image-2' } as any,
       });
       expect(imagePrompt).toContain('reply exactly `图片已生成`');
-      expect(imagePrompt).toContain('reply exactly `图片生成服务暂时不可用`');
+      expect(imagePrompt).toContain('MEDIA_DISPATCH_FAILED');
+      expect(imagePrompt).toContain('图片未生成：媒体生成调度失败，原因未分类');
       expect(imagePrompt).toContain('tool output and daemon logs');
       expect(imagePrompt).not.toContain('the filename, the model used');
       expect(imagePrompt).not.toContain('surface them verbatim to the user');
@@ -429,7 +452,8 @@ describe('composeSystemPrompt', () => {
         metadata: { kind: 'prototype' } as any,
       });
       expect(prototypePrompt).toContain('reply exactly `图片已生成`');
-      expect(prototypePrompt).toContain('reply exactly `图片生成服务暂时不可用`');
+      expect(prototypePrompt).toContain('MEDIA_DISPATCH_FAILED');
+      expect(prototypePrompt).toContain('图片未生成：媒体生成调度失败，原因未分类');
       expect(prototypePrompt).toContain('IMAGE_MODEL="vela/gpt-image-2"');
       expect(prototypePrompt).not.toContain(
         'For the best fal image model use `--model flux-pro-ultra`',
@@ -449,9 +473,9 @@ describe('composeSystemPrompt', () => {
           locale: 'zh-CN',
           metadata: metadata as any,
         });
-        expect(prompt).toContain('错误代码：{code}');
+        expect(prompt).toContain('错误代码：`{code}`');
         expect(prompt).toContain(
-          'without reclassifying either one from wording or HTTP status',
+          'public code and message without reclassifying either one from wording or HTTP',
         );
       }
     });
@@ -555,6 +579,9 @@ describe('composeSystemPrompt', () => {
         mediaExecution: { mode: 'disabled' },
       });
       expect(prompt).toContain('OpenDesign-owned media execution is **disabled for this run**');
+      expect(prompt).toContain('MEDIA_EXECUTION_DISABLED');
+      expect(prompt).toContain('本次任务未启用图片生成');
+      expect(prompt).not.toContain('describe the intended creative brief');
       expect(prompt).not.toContain('## Media generation contract');
       expect(prompt).not.toContain('External MCP servers — already authenticated');
     });

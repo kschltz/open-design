@@ -71,7 +71,10 @@ describe('DISCOVERY_AND_PHILOSOPHY (contracts copy) — prompt routing parity', 
     });
 
     expect(prompt).toContain('reply exactly `图片已生成`');
-    expect(prompt).toContain('reply exactly `图片生成服务暂时不可用`');
+    expect(prompt).toContain('图片未生成：内容安全策略拒绝了该请求');
+    expect(prompt).toContain('图片未生成：媒体生成调度失败，原因未分类');
+    expect(prompt).toContain('错误代码：`MEDIA_DISPATCH_FAILED`');
+    expect(prompt).not.toContain('图片生成服务暂时不可用');
     expect(prompt).toContain('tool output and daemon logs');
     expect(prompt).not.toContain('surface the actual stderr / exit status');
   });
@@ -142,6 +145,36 @@ describe('DISCOVERY_AND_PHILOSOPHY (contracts copy) — prompt routing parity', 
     expect(prompt).toContain("theme: 'dark'");
     expect(prompt).toContain('themeVariables');
     expect(prompt).toContain('no dark-on-dark labels');
+  });
+
+  it('ships API/BYOK decks with the same OD Deck Protocol v1', () => {
+    const prompt = composeSystemPrompt({ skillMode: 'deck', streamFormat: 'plain' });
+
+    expect(prompt).toContain('data-od-deck-protocol="1"');
+    expect(prompt).toContain("type: 'od:deck-ready'");
+    expect(prompt).toContain("data.type !== 'od:slide'");
+    expect(prompt).toContain('go(target);');
+    expect(prompt).toContain("type: 'od:slide-state'");
+    expect(prompt).toContain('## Final handoff — text artifact');
+    expect(prompt).toContain('MUST contain exactly one `<artifact type="text/html">...</artifact>` block');
+    expect(prompt).toContain('the artifact block itself is the canonical deliverable');
+    expect(prompt).not.toContain('## Final handoff — filesystem');
+    expect(prompt).not.toContain('summarize the written or changed deck file');
+  });
+
+  it('ships API/BYOK prototype follow-up deck requests with Deck Protocol v1', () => {
+    const prompt = composeSystemPrompt({
+      metadata: { kind: 'prototype' },
+      skillMode: 'prototype',
+      skillBody: '# Prototype seed\n\nCopy `assets/template.html` before building.',
+      freeformDeckSignal: true,
+      streamFormat: 'plain',
+    });
+
+    expect(prompt).toContain('data-od-deck-protocol="1"');
+    expect(prompt).toContain("type: 'od:deck-ready'");
+    expect(prompt).toContain("type: 'od:slide-state'");
+    expect(prompt).toContain('## Final handoff — text artifact');
   });
 
   it('injects nested-diagram discipline through every contracts deck path only', () => {

@@ -49,8 +49,10 @@ async function writeHyperframesRuntimeFixture(options: {
   const arch = options.platformName === "win32" ? "x64" : process.arch;
   const platform = options.platformName === "darwin" ? "darwin" : "win32";
   const nativePackage = `@img/sharp-${platform}-${arch}`;
-  const libvipsPackage = `@img/sharp-libvips-${platform}-${arch}`;
-  const packages = ["@img/colour", nativePackage, libvipsPackage];
+  const libvipsPackage = options.platformName === "darwin"
+    ? `@img/sharp-libvips-${platform}-${arch}`
+    : null;
+  const packages = ["@img/colour", nativePackage, ...(libvipsPackage == null ? [] : [libvipsPackage])];
   const sourceNodeModulesRoot = join(options.runtimeSourceRoot, "node_modules");
 
   for (const packageName of packages) {
@@ -68,8 +70,12 @@ async function writeHyperframesRuntimeFixture(options: {
       [
         'import colour from "@img/colour";',
         `import native from ${JSON.stringify(nativePackage)};`,
-        `import libvips from ${JSON.stringify(libvipsPackage)};`,
-        "export default { colour, native, libvips };",
+        ...(libvipsPackage == null
+          ? ["export default { colour, native };"]
+          : [
+              `import libvips from ${JSON.stringify(libvipsPackage)};`,
+              "export default { colour, native, libvips };",
+            ]),
         "",
       ].join("\n"),
     );
@@ -100,6 +106,12 @@ async function writeHyperframesRuntimeFixture(options: {
     ? join(appPath, "Open Design.exe")
     : join(appPath, "Contents", "MacOS", "Open Design");
   await mkdir(path.dirname(bundledNodePath), { recursive: true });
+  if (process.platform !== "win32") {
+    const quotedNodePath = process.execPath.replaceAll("'", "'\\''");
+    await writeFile(bundledNodePath, `#!/bin/sh\nexec '${quotedNodePath}' "$@"\n`, "utf8");
+    await chmod(bundledNodePath, 0o755);
+    return;
+  }
   try {
     await link(process.execPath, bundledNodePath);
   } catch {
@@ -289,7 +301,6 @@ describe("web standalone afterPack hook", () => {
         "sharp",
         "@img/colour",
         "@img/sharp-win32-x64",
-        "@img/sharp-libvips-win32-x64",
       ]);
       expect(report.hyperframesRuntimeCopies.every((entry) => entry.bytes > 0)).toBe(true);
       expect(report.hyperframesCliSmoke.stdout).toBe("hyperframes 0.8.1");
@@ -304,11 +315,19 @@ describe("web standalone afterPack hook", () => {
     }
   });
 
-  it("fails packaging when HyperFrames' target libvips payload is absent", async () => {
+  it("fails packaging when HyperFrames' target native sharp payload is absent", async () => {
     await expect(runFixture({
       includeWebNext: true,
-      omitHyperframesRuntimePackage: "@img/sharp-libvips-win32-x64",
-    })).rejects.toThrow(/required source missing.*sharp-libvips-win32-x64/);
+      omitHyperframesRuntimePackage: "@img/sharp-win32-x64",
+    })).rejects.toThrow(/required source missing.*sharp-win32-x64/);
+  });
+
+  it("rejects unsupported packaging platforms", async () => {
+    await expect(runWebStandaloneAfterPack({
+      appOutDir: "/tmp/open-design-linux",
+      electronPlatformName: "linux",
+      packager: { appInfo: { productFilename: "Open Design" } },
+    })).rejects.toThrow(/unsupported platform: linux/);
   });
 
   it("deduplicates win32 copied standalone Next while retaining the app-local Next package", async () => {
