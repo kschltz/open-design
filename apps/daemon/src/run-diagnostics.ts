@@ -65,6 +65,17 @@ export interface RunDiagnosticsAnalytics {
   // with a fresh session + full transcript, with no user-facing error. Lets us
   // monitor how often the resume optimization falls back (should be rare).
   resume_auto_reseeded: boolean;
+  prompt_budget_version?: 'prompt_budget_v1';
+  prompt_frame_bytes?: number;
+  prompt_bytes?: number;
+  prompt_token_estimate?: number;
+  prompt_token_estimate_method?: 'utf8_bytes_div_3_ceil_v1';
+  prompt_session_mode?: 'new' | 'resume';
+  prompt_model_id?: string;
+  prompt_context_window_source?: 'model_metadata' | 'unknown';
+  prompt_context_window_tokens?: number;
+  prompt_prior_session_usage_source?: 'agent_session' | 'unknown';
+  prompt_prior_session_input_tokens?: number;
   tool_execution_lifecycle_seen?: boolean;
   tool_execution_lifecycle_count_bucket?: '1' | '2_5' | '6_20' | 'gt_20';
   tool_execution_trigger?: 'exit' | 'abort' | 'deadline' | 'mixed' | 'unknown';
@@ -94,11 +105,77 @@ export type StdoutTailSummary = StreamTailSummary;
 
 const STDERR_TAIL_MAX_LINES = 20;
 export const STDERR_TAIL_MAX_BYTES = 4 * 1024;
+const PROMPT_BUDGET_MAX_NUMERIC_VALUE = 1_000_000_000;
 
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function promptBudgetInteger(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= PROMPT_BUDGET_MAX_NUMERIC_VALUE
+    ? value
+    : undefined;
+}
+
+function promptBudgetModelId(value: unknown): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) return 'default';
+  if (trimmed.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/.test(trimmed)) {
+    return 'other';
+  }
+  return redactSecrets(trimmed) === trimmed ? trimmed : 'redacted';
+}
+
+export function promptBudgetAnalyticsFromDiagnostic(
+  data: Record<string, unknown>,
+): Partial<RunDiagnosticsAnalytics> | null {
+  if (
+    data.type !== 'diagnostic' ||
+    data.name !== 'prompt_budget_v1' ||
+    data.schemaVersion !== 1 ||
+    data.tokenEstimateMethod !== 'utf8_bytes_div_3_ceil_v1'
+  ) {
+    return null;
+  }
+  const frameBytes = promptBudgetInteger(data.frameBytes);
+  const promptBytes = promptBudgetInteger(data.promptBytes);
+  const promptTokenEstimate = promptBudgetInteger(data.promptTokenEstimate);
+  if (
+    frameBytes === undefined ||
+    promptBytes === undefined ||
+    promptTokenEstimate === undefined
+  ) {
+    return null;
+  }
+  const sessionMode = data.sessionMode === 'resume' ? 'resume' : 'new';
+  const contextWindowSource = data.contextWindowSource === 'model_metadata'
+    ? 'model_metadata'
+    : 'unknown';
+  const priorSessionUsageSource = data.priorSessionUsageSource === 'agent_session'
+    ? 'agent_session'
+    : 'unknown';
+  const contextWindowTokens = promptBudgetInteger(data.contextWindowTokens);
+  const priorSessionInputTokens = promptBudgetInteger(data.priorSessionInputTokens);
+  return {
+    prompt_budget_version: 'prompt_budget_v1',
+    prompt_frame_bytes: frameBytes,
+    prompt_bytes: promptBytes,
+    prompt_token_estimate: promptTokenEstimate,
+    prompt_token_estimate_method: 'utf8_bytes_div_3_ceil_v1',
+    prompt_session_mode: sessionMode,
+    prompt_model_id: promptBudgetModelId(data.modelId),
+    prompt_context_window_source: contextWindowSource,
+    ...(contextWindowTokens !== undefined ? { prompt_context_window_tokens: contextWindowTokens } : {}),
+    prompt_prior_session_usage_source: priorSessionUsageSource,
+    ...(priorSessionInputTokens !== undefined
+      ? { prompt_prior_session_input_tokens: priorSessionInputTokens }
+      : {}),
+  };
 }
 
 function amrOpenCodeErrorPhase(value: unknown): TrackingAmrOpenCodeErrorPhase | undefined {
@@ -428,17 +505,15 @@ function truncateUtf8(value: string, maxBytes: number): {
   return { value: value.slice(0, end), truncated: true };
 }
 
-function collectStreamTailSummary(
-  events: RunEventForDiagnostics[] = [],
-  eventName: string,
-  readChunk: (data: unknown) => string | null,
-): StreamTailSummary | undefined {
-  let streamText = '';
-  for (const event of events) {
-    if (event.event !== eventName) continue;
-    const chunk = readChunk(event.data);
-    if (chunk) streamText += chunk;
-  }
+/**
+ * The one bound this repository puts on captured process output before it
+ * leaves the daemon: the last {@link STDERR_TAIL_MAX_LINES} lines, capped at
+ * {@link STDERR_TAIL_MAX_BYTES} UTF-8 bytes, with `redactSecrets` applied.
+ *
+ * Returns `undefined` for an empty stream so every caller renders nothing
+ * rather than an empty section.
+ */
+export function summarizeStreamTailText(streamText: string): StreamTailSummary | undefined {
   const lineCount = countLines(streamText);
   if (lineCount <= 0) return undefined;
 
@@ -455,6 +530,66 @@ function collectStreamTailSummary(
   };
 }
 
+/** Prefixed onto a tail whose earlier lines were dropped, so a reader knows the
+ *  card is showing an excerpt and that 「Export logs」 holds the whole thing. */
+export const STDERR_TAIL_TRUNCATION_MARKER = '[earlier stderr omitted]';
+
+/**
+ * The stderr a run-failure card is allowed to show: the same bounded, redacted
+ * tail the telemetry exporter uses, plus an explicit marker when earlier output
+ * was dropped.
+ *
+ * The card's copy promises the reader "the original error"; a failure whose
+ * `message` is the daemon's own generic sentence has that original only here.
+ * Bounding and redaction happen daemon-side so the text is already safe by the
+ * time it reaches the SSE stream, the persisted message, or any other consumer.
+ */
+export function failureCardStderrTail(streamText: string): string | undefined {
+  const summary = summarizeStreamTailText(streamText);
+  if (!summary || !summary.tail.trim()) return undefined;
+  return summary.truncated
+    ? `${STDERR_TAIL_TRUNCATION_MARKER}\n${summary.tail}`
+    : summary.tail;
+}
+
+/**
+ * Decorate a run's terminal `error` frame with the stderr that same run already
+ * emitted, so the single payload reaching both the live client and the
+ * persisted assistant message carries the original cause.
+ *
+ * Additive only: `message` / `error.code` are left exactly as the emitter wrote
+ * them, because those are what the failure classifiers and the card mapping
+ * read. Returns `data` untouched for any other event, for a run that wrote no
+ * stderr, and for a payload that already carries a tail.
+ */
+export function withFailureStderrTail(
+  event: string,
+  data: unknown,
+  stderrText: string,
+): unknown {
+  if (event !== 'error') return data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+  const payload = data as Record<string, unknown>;
+  if (typeof payload.stderrTail === 'string') return data;
+  const tail = failureCardStderrTail(stderrText);
+  if (!tail) return data;
+  return { ...payload, stderrTail: tail };
+}
+
+function collectStreamTailSummary(
+  events: RunEventForDiagnostics[] = [],
+  eventName: string,
+  readChunk: (data: unknown) => string | null,
+): StreamTailSummary | undefined {
+  let streamText = '';
+  for (const event of events) {
+    if (event.event !== eventName) continue;
+    const chunk = readChunk(event.data);
+    if (chunk) streamText += chunk;
+  }
+  return summarizeStreamTailText(streamText);
+}
+
 export function collectStderrTailSummary(
   events: RunEventForDiagnostics[] = [],
 ): StderrTailSummary | undefined {
@@ -469,6 +604,8 @@ export function collectStdoutTailSummary(
 
 export function summarizeRunDiagnosticsForAnalytics(args: {
   events?: RunEventForDiagnostics[];
+  /** Validated projection folded before the in-memory event tail can evict it. */
+  promptBudgetDiagnostics?: Partial<RunDiagnosticsAnalytics> | null | undefined;
   exitCode?: number | null;
   signal?: string | null;
   cancelRequested?: boolean;
@@ -491,6 +628,8 @@ export function summarizeRunDiagnosticsForAnalytics(args: {
   let recordedCloseReason: RunCloseReason | null = null;
   let resumeAutoReseeded = false;
   let amrOpenCodeDiagnostics: Partial<RunDiagnosticsAnalytics> = {};
+  let promptBudgetDiagnostics: Partial<RunDiagnosticsAnalytics> =
+    args.promptBudgetDiagnostics ?? {};
   for (const event of events) {
     if (event.event === 'stderr') {
       const chunk = readStderrChunk(event.data);
@@ -513,6 +652,8 @@ export function summarizeRunDiagnosticsForAnalytics(args: {
     if (data.type === 'diagnostic' && data.name === 'acp_approval_request') {
       approvalRequested = true;
     }
+    const promptBudget = promptBudgetAnalyticsFromDiagnostic(data);
+    if (promptBudget) promptBudgetDiagnostics = promptBudget;
     if (event.event === 'diagnostic' && data.type === 'agent_resume_auto_reseed') {
       resumeAutoReseeded = true;
     }
@@ -593,6 +734,7 @@ export function summarizeRunDiagnosticsForAnalytics(args: {
     live_artifact_seen: liveArtifactSeen,
     resume_auto_reseeded: resumeAutoReseeded,
     ...amrOpenCodeDiagnostics,
+    ...promptBudgetDiagnostics,
     ...toolExecutionLifecycle,
   };
 }
